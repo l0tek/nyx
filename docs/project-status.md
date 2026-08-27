@@ -46,8 +46,12 @@ not suitable for sensitive or production communication.
 - `nyx-crypto` creates a two-member group, adds the peer KeyPackage, serializes
   and processes the Welcome, verifies matching epoch authenticators, exchanges
   encrypted application messages, and rejects replayed messages.
-- The SQLite client-store boundary remains a scaffold.
-- The workspace currently has eleven crypto/transport/mailbox/protocol unit tests
+- `nyx-store` provides an authenticated encrypted-blob format using Argon2id
+  and XChaCha20-Poly1305. Headers are authenticated, derived keys and loaded
+  plaintext are zeroized, files are atomically replaced, and Unix temporary
+  files use mode `0600`.
+- The generic SQLite client-store boundary remains a separate scaffold.
+- The workspace currently has fourteen store/crypto/transport/mailbox/protocol unit tests
   covering MLS group/Welcome/message processing, replay rejection, device
   material validation, request serialization,
   oversized-frame rejection, receipt binding, mailbox lifecycle, cross-mailbox
@@ -62,8 +66,9 @@ not suitable for sensitive or production communication.
   two-member MLS conversation is volatile and recreated on app start.
 - Device identity generation, contact invitations, out-of-band verification,
   and multi-device behavior are not implemented.
-- The local client store is not encrypted and contains only a generic `kv`
-  scaffold.
+- The encrypted blob store is not yet connected to OpenMLS's storage traits or
+  the desktop lifecycle. The generic client SQLite `kv` store remains
+  unencrypted and must not hold secrets.
 - Attachment transfer, padding buckets, batching, cover traffic, token
   rotation, retries, encrypted ACK payloads, and optional direct peer Onion
   Services are not implemented.
@@ -105,7 +110,7 @@ publication or reachability on the public Tor network.
 
 ## Next milestone
 
-The next useful milestone is encrypted persistence for device keys and OpenMLS
-group state, followed by a queue that moves serialized MLS messages between the
-desktop app and `nyx-tor`. The manual live-Tor smoke test should later become an
-isolated, opt-in CI job.
+The next useful milestone is connecting the encrypted blob format to device
+keys and OpenMLS group state, followed by a queue that moves serialized MLS
+messages between the desktop app and `nyx-tor`. The manual live-Tor smoke test
+should later become an isolated, opt-in CI job.

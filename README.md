@@ -80,8 +80,9 @@ headless `nyx-tor` mailbox client are implemented, but the desktop UI is not
 connected to mailbox delivery. The desktop app demonstrates a real in-memory
 two-member OpenMLS group, Welcome processing, encryption, decryption, and replay
 protection. Encrypted persistence and remote group synchronization remain
-incomplete. Do not replace the crypto boundary with ad-hoc cryptography or use
-the demo for sensitive messaging.
+incomplete. An Argon2id/XChaCha20-Poly1305 encrypted blob-store foundation is
+available but not yet wired to OpenMLS state. Do not replace the crypto boundary
+with ad-hoc cryptography or use the demo for sensitive messaging.
 
 ## Security rule
 
