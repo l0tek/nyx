@@ -4779,6 +4779,7 @@ dependencies = [
  "postcard",
  "serde",
  "tempfile",
+ "uuid",
  "zeroize",
 ]
 

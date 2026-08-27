@@ -97,7 +97,9 @@ messages. After Save or Unlock, inbound ratchet advancement and mailbox receipts
 are atomically persisted before acknowledgement; repeats after an ACK failure
 are safely recognized. The vault locks after five minutes of inactivity by
 default (`NYX_VAULT_LOCK_TIMEOUT_SECS`) and can also be locked explicitly.
-Initial and outbound saving remain manual. Do not replace the crypto boundary with
+Initial saving remains manual. When delivery is configured, outbound ratchet
+advancement is atomically journaled in the encrypted vault before an idempotent
+handoff to the SQLite delivery queue. Do not replace the crypto boundary with
 ad-hoc cryptography or use the demo for sensitive messaging.
 
 ## Security rule

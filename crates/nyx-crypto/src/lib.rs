@@ -18,12 +18,14 @@ use std::{
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
+use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 pub const NYX_CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
 const MAX_DEVICE_IDENTITY_SIZE: usize = 1024;
-const SNAPSHOT_VERSION: u16 = 2;
+const SNAPSHOT_VERSION: u16 = 3;
 const MAX_INBOUND_RECEIPTS: usize = 4096;
+const MAX_OUTBOUND_JOURNAL: usize = 1024;
 
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct LocalSecret(pub Vec<u8>);
@@ -49,10 +51,23 @@ pub struct MlsConversation {
     alice_group: MlsGroup,
     bob_group: MlsGroup,
     inbound_receipts: Vec<InboundReceipt>,
+    pending_outbound: Vec<PendingOutbound>,
 }
 
 #[derive(SerdeSerialize, SerdeDeserialize)]
 struct ConversationSnapshot {
+    version: u16,
+    group_id: Vec<u8>,
+    alice_signature_key: Vec<u8>,
+    bob_signature_key: Vec<u8>,
+    alice_storage: HashMap<Vec<u8>, Vec<u8>>,
+    bob_storage: HashMap<Vec<u8>, Vec<u8>>,
+    inbound_receipts: Vec<InboundReceipt>,
+    pending_outbound: Vec<PendingOutbound>,
+}
+
+#[derive(SerdeSerialize, SerdeDeserialize)]
+struct VersionTwoConversationSnapshot {
     version: u16,
     group_id: Vec<u8>,
     alice_signature_key: Vec<u8>,
@@ -78,9 +93,24 @@ struct InboundReceipt {
     expires_unix_ms: i64,
 }
 
+#[derive(Clone, SerdeSerialize, SerdeDeserialize)]
+pub struct PendingOutbound {
+    pub id: Uuid,
+    pub mailbox_token: [u8; 32],
+    pub ciphertext: Vec<u8>,
+}
+
+impl Drop for PendingOutbound {
+    fn drop(&mut self) {
+        self.mailbox_token.zeroize();
+        self.ciphertext.zeroize();
+    }
+}
+
 impl Drop for MlsConversation {
     fn drop(&mut self) {
         self.inbound_receipts.zeroize();
+        self.pending_outbound.clear();
     }
 }
 
@@ -100,6 +130,23 @@ impl Drop for LegacyConversationSnapshot {
     }
 }
 
+impl Drop for VersionTwoConversationSnapshot {
+    fn drop(&mut self) {
+        self.group_id.zeroize();
+        self.alice_signature_key.zeroize();
+        self.bob_signature_key.zeroize();
+        for (mut key, mut value) in self.alice_storage.drain() {
+            key.zeroize();
+            value.zeroize();
+        }
+        for (mut key, mut value) in self.bob_storage.drain() {
+            key.zeroize();
+            value.zeroize();
+        }
+        self.inbound_receipts.zeroize();
+    }
+}
+
 impl Drop for ConversationSnapshot {
     fn drop(&mut self) {
         self.group_id.zeroize();
@@ -114,6 +161,7 @@ impl Drop for ConversationSnapshot {
             value.zeroize();
         }
         self.inbound_receipts.zeroize();
+        self.pending_outbound.clear();
     }
 }
 
@@ -224,6 +272,7 @@ impl MlsConversation {
             alice_group,
             bob_group,
             inbound_receipts: Vec::new(),
+            pending_outbound: Vec::new(),
         })
     }
 
@@ -338,6 +387,65 @@ impl MlsConversation {
         Ok(plaintext)
     }
 
+    /// Creates an outbound MLS message and persists the advanced sender and
+    /// demo-peer ratchets together with a durable handoff record. A failed save
+    /// restores the complete pre-message state.
+    pub fn create_outbound_and_save(
+        &mut self,
+        plaintext: &[u8],
+        mailbox_token: [u8; 32],
+        path: impl AsRef<Path>,
+        password: &[u8],
+    ) -> Result<(PendingOutbound, Vec<u8>)> {
+        if self.pending_outbound.len() >= MAX_OUTBOUND_JOURNAL {
+            bail!("outbound MLS journal is full");
+        }
+        let before = self.snapshot()?;
+        let ciphertext = self.encrypt_from_alice(plaintext)?;
+        let decrypted = match self.decrypt_for_bob(&ciphertext) {
+            Ok(decrypted) => decrypted,
+            Err(error) => {
+                *self = Self::from_snapshot(before)?;
+                return Err(error);
+            }
+        };
+        let pending = PendingOutbound {
+            id: Uuid::new_v4(),
+            mailbox_token,
+            ciphertext,
+        };
+        let mut snapshot = self.snapshot()?;
+        snapshot.pending_outbound.push(pending.clone());
+        if let Err(error) = Self::save_snapshot(&snapshot, path, password) {
+            *self = Self::from_snapshot(before)
+                .context("restore MLS state after failed outbound safe-save")?;
+            return Err(error);
+        }
+        *self = Self::from_snapshot(snapshot)?;
+        Ok((pending, decrypted))
+    }
+
+    pub fn pending_outbound(&self) -> Vec<PendingOutbound> {
+        self.pending_outbound.clone()
+    }
+
+    /// Removes a handoff record only after SQLite accepted the same stable ID.
+    pub fn mark_outbound_queued_and_save(
+        &mut self,
+        id: Uuid,
+        path: impl AsRef<Path>,
+        password: &[u8],
+    ) -> Result<()> {
+        if !self.pending_outbound.iter().any(|pending| pending.id == id) {
+            bail!("outbound MLS journal entry does not exist");
+        }
+        let mut snapshot = self.snapshot()?;
+        snapshot.pending_outbound.retain(|pending| pending.id != id);
+        Self::save_snapshot(&snapshot, path, password)?;
+        *self = Self::from_snapshot(snapshot)?;
+        Ok(())
+    }
+
     pub fn save_encrypted(&self, path: impl AsRef<Path>, password: &[u8]) -> Result<()> {
         let snapshot = self.snapshot()?;
         Self::save_snapshot(&snapshot, path, password)
@@ -352,6 +460,7 @@ impl MlsConversation {
             alice_storage: clone_storage(self.alice.provider())?,
             bob_storage: clone_storage(self.bob.provider())?,
             inbound_receipts: self.inbound_receipts().to_vec(),
+            pending_outbound: self.pending_outbound(),
         })
     }
 
@@ -373,19 +482,36 @@ impl MlsConversation {
         let snapshot = match postcard::from_bytes::<ConversationSnapshot>(&encoded) {
             Ok(snapshot) if snapshot.version == SNAPSHOT_VERSION => snapshot,
             _ => {
-                let mut legacy: LegacyConversationSnapshot =
-                    postcard::from_bytes(&encoded).context("deserialize MLS snapshot")?;
-                if legacy.version != 1 {
-                    bail!("MLS snapshot version is unsupported");
-                }
-                ConversationSnapshot {
-                    version: SNAPSHOT_VERSION,
-                    group_id: std::mem::take(&mut legacy.group_id),
-                    alice_signature_key: std::mem::take(&mut legacy.alice_signature_key),
-                    bob_signature_key: std::mem::take(&mut legacy.bob_signature_key),
-                    alice_storage: std::mem::take(&mut legacy.alice_storage),
-                    bob_storage: std::mem::take(&mut legacy.bob_storage),
-                    inbound_receipts: Vec::new(),
+                if let Ok(mut version_two) =
+                    postcard::from_bytes::<VersionTwoConversationSnapshot>(&encoded)
+                    && version_two.version == 2
+                {
+                    ConversationSnapshot {
+                        version: SNAPSHOT_VERSION,
+                        group_id: std::mem::take(&mut version_two.group_id),
+                        alice_signature_key: std::mem::take(&mut version_two.alice_signature_key),
+                        bob_signature_key: std::mem::take(&mut version_two.bob_signature_key),
+                        alice_storage: std::mem::take(&mut version_two.alice_storage),
+                        bob_storage: std::mem::take(&mut version_two.bob_storage),
+                        inbound_receipts: std::mem::take(&mut version_two.inbound_receipts),
+                        pending_outbound: Vec::new(),
+                    }
+                } else {
+                    let mut legacy: LegacyConversationSnapshot =
+                        postcard::from_bytes(&encoded).context("deserialize MLS snapshot")?;
+                    if legacy.version != 1 {
+                        bail!("MLS snapshot version is unsupported");
+                    }
+                    ConversationSnapshot {
+                        version: SNAPSHOT_VERSION,
+                        group_id: std::mem::take(&mut legacy.group_id),
+                        alice_signature_key: std::mem::take(&mut legacy.alice_signature_key),
+                        bob_signature_key: std::mem::take(&mut legacy.bob_signature_key),
+                        alice_storage: std::mem::take(&mut legacy.alice_storage),
+                        bob_storage: std::mem::take(&mut legacy.bob_storage),
+                        inbound_receipts: Vec::new(),
+                        pending_outbound: Vec::new(),
+                    }
                 }
             }
         };
@@ -439,6 +565,7 @@ impl MlsConversation {
             alice_group,
             bob_group,
             inbound_receipts: std::mem::take(&mut snapshot.inbound_receipts),
+            pending_outbound: std::mem::take(&mut snapshot.pending_outbound),
         })
     }
 
@@ -647,5 +774,87 @@ mod tests {
         let restored = MlsConversation::load_encrypted(&path, b"vault password").unwrap();
         assert_eq!(restored.member_count(), 2);
         assert!(!restored.has_inbound_receipt(&[1; 32]));
+    }
+
+    #[test]
+    fn loads_version_two_snapshot_without_outbound_journal() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("version-two.nyx");
+        let conversation = MlsConversation::new_1to1(b"alice".to_vec(), b"bob".to_vec()).unwrap();
+        let version_two = VersionTwoConversationSnapshot {
+            version: 2,
+            group_id: conversation.alice_group.group_id().as_slice().to_vec(),
+            alice_signature_key: conversation
+                .alice
+                .credential
+                .signature_key
+                .as_slice()
+                .to_vec(),
+            bob_signature_key: conversation
+                .bob
+                .credential
+                .signature_key
+                .as_slice()
+                .to_vec(),
+            alice_storage: clone_storage(conversation.alice.provider()).unwrap(),
+            bob_storage: clone_storage(conversation.bob.provider()).unwrap(),
+            inbound_receipts: Vec::new(),
+        };
+        let encoded = zeroize::Zeroizing::new(postcard::to_allocvec(&version_two).unwrap());
+        nyx_store::EncryptedBlobStore::save(&path, b"vault password", &encoded).unwrap();
+
+        let restored = MlsConversation::load_encrypted(&path, b"vault password").unwrap();
+        assert_eq!(restored.member_count(), 2);
+        assert!(restored.pending_outbound().is_empty());
+    }
+
+    #[test]
+    fn outbound_ratchets_and_queue_handoff_are_saved_together() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.nyx");
+        let mut conversation =
+            MlsConversation::new_1to1(b"alice".to_vec(), b"bob".to_vec()).unwrap();
+
+        let (pending, decrypted) = conversation
+            .create_outbound_and_save(b"durable outbound", [8; 32], &path, b"vault password")
+            .unwrap();
+        assert_eq!(decrypted, b"durable outbound");
+        assert_eq!(conversation.pending_outbound().len(), 1);
+
+        let mut restored = MlsConversation::load_encrypted(&path, b"vault password").unwrap();
+        assert_eq!(restored.pending_outbound()[0].id, pending.id);
+        restored
+            .mark_outbound_queued_and_save(pending.id, &path, b"vault password")
+            .unwrap();
+        assert!(
+            MlsConversation::load_encrypted(&path, b"vault password")
+                .unwrap()
+                .pending_outbound()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn failed_outbound_safe_save_restores_ratchets() {
+        let directory = tempfile::tempdir().unwrap();
+        let valid_path = directory.path().join("state.nyx");
+        let mut conversation =
+            MlsConversation::new_1to1(b"alice".to_vec(), b"bob".to_vec()).unwrap();
+
+        assert!(
+            conversation
+                .create_outbound_and_save(
+                    b"retry outbound",
+                    [5; 32],
+                    directory.path(),
+                    b"vault password",
+                )
+                .is_err()
+        );
+        assert!(conversation.pending_outbound().is_empty());
+        let (_, decrypted) = conversation
+            .create_outbound_and_save(b"retry outbound", [5; 32], valid_path, b"vault password")
+            .unwrap();
+        assert_eq!(decrypted, b"retry outbound");
     }
 }

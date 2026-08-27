@@ -64,18 +64,38 @@ impl DeliveryQueue {
     }
 
     pub fn enqueue(&self, mailbox_token: [u8; 32], ciphertext: &[u8]) -> Result<Uuid> {
+        let id = Uuid::new_v4();
+        self.enqueue_idempotent(id, mailbox_token, ciphertext)?;
+        Ok(id)
+    }
+
+    /// Inserts a journaled outbound item exactly once. Retrying the same ID and
+    /// payload is safe; reusing an ID for different data is rejected.
+    pub fn enqueue_idempotent(
+        &self,
+        id: Uuid,
+        mailbox_token: [u8; 32],
+        ciphertext: &[u8],
+    ) -> Result<()> {
         if ciphertext.is_empty() {
             bail!("queued MLS ciphertext must not be empty");
         }
         if ciphertext.len() > MAX_CIPHERTEXT_SIZE {
             bail!("queued MLS ciphertext exceeds maximum size");
         }
-        let id = Uuid::new_v4();
         self.conn.execute(
-            "INSERT INTO outbound_delivery (id, mailbox_token, ciphertext, queued_unix_ms) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT OR IGNORE INTO outbound_delivery (id, mailbox_token, ciphertext, queued_unix_ms) VALUES (?1, ?2, ?3, ?4)",
             rusqlite::params![id.to_string(), mailbox_token.as_slice(), ciphertext, unix_time_ms()?],
         )?;
-        Ok(id)
+        let stored = self.conn.query_row(
+            "SELECT mailbox_token, ciphertext FROM outbound_delivery WHERE id = ?1",
+            [id.to_string()],
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )?;
+        if stored.0.as_slice() != mailbox_token || stored.1 != ciphertext {
+            bail!("delivery queue id is already bound to different ciphertext");
+        }
+        Ok(())
     }
 
     pub fn pending(&self, limit: u16) -> Result<Vec<QueuedDelivery>> {
@@ -361,5 +381,29 @@ mod tests {
         assert!(queue.enqueue([0; 32], b"").is_err());
         assert!(queue.pending(0).is_err());
         assert!(queue.pending(129).is_err());
+    }
+
+    #[test]
+    fn delivery_queue_idempotently_accepts_journal_handoff() {
+        let directory = tempfile::tempdir().unwrap();
+        let queue = DeliveryQueue::open(directory.path().join("delivery.sqlite3")).unwrap();
+        let id = Uuid::new_v4();
+        queue
+            .enqueue_idempotent(id, [3; 32], b"stable MLS ciphertext")
+            .unwrap();
+        queue
+            .enqueue_idempotent(id, [3; 32], b"stable MLS ciphertext")
+            .unwrap();
+        assert_eq!(queue.pending(10).unwrap().len(), 1);
+        assert!(
+            queue
+                .enqueue_idempotent(id, [4; 32], b"stable MLS ciphertext")
+                .is_err()
+        );
+        assert!(
+            queue
+                .enqueue_idempotent(id, [3; 32], b"different ciphertext")
+                .is_err()
+        );
     }
 }

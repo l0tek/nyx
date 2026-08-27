@@ -207,7 +207,7 @@ pub fn App() -> Element {
                             onkeydown: move |event| {
                                 if event.key() == Key::Enter {
                                     touch_vault(&mut vault_last_activity, &autosave_password);
-                                    send_message(&mut conversation, &delivery_queue, &mailbox_token, &mut draft, &mut messages, &mut last_error);
+                                    send_message(&mut conversation, &delivery_queue, &mailbox_token, &mut draft, &mut messages, &mut last_error, &autosave_password);
                                 }
                             }
                         }
@@ -215,7 +215,7 @@ pub fn App() -> Element {
                             disabled: !mls_ready || draft.read().trim().is_empty(),
                             onclick: move |_| {
                                 touch_vault(&mut vault_last_activity, &autosave_password);
-                                send_message(&mut conversation, &delivery_queue, &mailbox_token, &mut draft, &mut messages, &mut last_error);
+                                send_message(&mut conversation, &delivery_queue, &mailbox_token, &mut draft, &mut messages, &mut last_error, &autosave_password);
                             },
                             "Encrypt & send"
                         }
@@ -301,6 +301,21 @@ async fn run_delivery_worker(
         status.set("Tor ready; watching delivery queue".into());
 
         loop {
+            if !autosave_password.read().is_empty() {
+                match sync_outbound_journal(
+                    &mut conversation,
+                    &queue,
+                    autosave_password.read().as_slice(),
+                ) {
+                    Ok(recovered) if recovered > 0 => status.set(format!(
+                        "Tor ready; recovered {recovered} outbound message(s) into delivery queue"
+                    )),
+                    Ok(_) => {}
+                    Err(error) => status.set(format!(
+                        "Outbound journal recovery failed; will retry: {error}"
+                    )),
+                }
+            }
             match transport.flush_delivery_queue(&endpoint, &queue, 32).await {
                 Ok(report) if report.delivered > 0 => status.set(format!(
                     "Tor ready; delivered {} queued message(s)",
@@ -440,6 +455,7 @@ fn send_message(
     draft: &mut Signal<String>,
     messages: &mut Signal<Vec<DisplayMessage>>,
     last_error: &mut Signal<Option<String>>,
+    autosave_password: &Signal<Zeroizing<Vec<u8>>>,
 ) {
     let plaintext = draft.read().trim().to_owned();
     if plaintext.is_empty() {
@@ -447,28 +463,58 @@ fn send_message(
     }
     let result = match conversation.write().as_mut() {
         Ok(conversation) => (|| {
-            let ciphertext = conversation
-                .encrypt_from_alice(plaintext.as_bytes())
-                .map_err(|error| error.to_string())?;
-            let queued = match (delivery_queue.read().as_ref(), mailbox_token.as_ref()) {
-                (Ok(queue), Some(token)) => {
-                    queue
-                        .enqueue(*token, &ciphertext)
+            let (ciphertext_size, decrypted, queued, warning) = match mailbox_token.as_ref() {
+                Some(token) => {
+                    let queue_state = delivery_queue.read();
+                    let queue = queue_state
+                        .as_ref()
+                        .map_err(|error| format!("Delivery queue unavailable: {error}"))?;
+                    if autosave_password.read().is_empty() {
+                        return Err(
+                            "Save or unlock the vault before queueing an outbound message".into(),
+                        );
+                    }
+                    let (pending, decrypted) = conversation
+                        .create_outbound_and_save(
+                            plaintext.as_bytes(),
+                            *token,
+                            state_path(),
+                            autosave_password.read().as_slice(),
+                        )
                         .map_err(|error| error.to_string())?;
-                    true
+                    let ciphertext_size = pending.ciphertext.len();
+                    let warning = match queue.enqueue_idempotent(
+                        pending.id,
+                        pending.mailbox_token,
+                        &pending.ciphertext,
+                    ) {
+                        Ok(()) => conversation
+                            .mark_outbound_queued_and_save(
+                                pending.id,
+                                state_path(),
+                                autosave_password.read().as_slice(),
+                            )
+                            .err()
+                            .map(|error| format!("Queue handoff saved for retry: {error}")),
+                        Err(error) => Some(format!(
+                            "Message is safe in outbound journal; queue handoff will retry: {error}"
+                        )),
+                    };
+                    (ciphertext_size, decrypted, true, warning)
                 }
-                _ => false,
+                None => {
+                    let (ciphertext_size, decrypted) = conversation
+                        .round_trip_from_alice(plaintext.as_bytes())
+                        .map_err(|error| error.to_string())?;
+                    (ciphertext_size, decrypted, false, None)
+                }
             };
-            let ciphertext_size = ciphertext.len();
-            let decrypted = conversation
-                .decrypt_for_bob(&ciphertext)
-                .map_err(|error| error.to_string())?;
-            Ok((ciphertext_size, decrypted, queued))
+            Ok((ciphertext_size, decrypted, queued, warning))
         })(),
         Err(error) => Err(error.clone()),
     };
     match result {
-        Ok((ciphertext_size, decrypted, queued)) => match String::from_utf8(decrypted) {
+        Ok((ciphertext_size, decrypted, queued, warning)) => match String::from_utf8(decrypted) {
             Ok(decrypted) => {
                 messages.write().push(DisplayMessage {
                     plaintext: decrypted,
@@ -477,12 +523,33 @@ fn send_message(
                     incoming: false,
                 });
                 draft.set(String::new());
-                last_error.set(None);
+                last_error.set(warning);
             }
             Err(_) => last_error.set(Some("Peer returned invalid UTF-8 application data".into())),
         },
         Err(error) => last_error.set(Some(error)),
     }
+}
+
+fn sync_outbound_journal(
+    conversation: &mut Signal<Result<MlsConversation, String>>,
+    queue: &DeliveryQueue,
+    password: &[u8],
+) -> Result<usize, String> {
+    let mut conversation_state = conversation.write();
+    let conversation = conversation_state.as_mut().map_err(|error| error.clone())?;
+    let pending = conversation.pending_outbound();
+    let mut recovered = 0;
+    for item in pending {
+        queue
+            .enqueue_idempotent(item.id, item.mailbox_token, &item.ciphertext)
+            .map_err(|error| error.to_string())?;
+        conversation
+            .mark_outbound_queued_and_save(item.id, state_path(), password)
+            .map_err(|error| error.to_string())?;
+        recovered += 1;
+    }
+    Ok(recovered)
 }
 
 fn touch_vault(

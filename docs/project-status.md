@@ -62,6 +62,12 @@ not suitable for sensitive or production communication.
   that queue when `NYX_RECIPIENT_MAILBOX_TOKEN_HEX` is configured. The queue
   path defaults to `nyx-delivery.sqlite3` and can be overridden with
   `NYX_DELIVERY_QUEUE_PATH`.
+- Before an outbound message enters SQLite, the advanced MLS ratchets, stable
+  queue UUID, recipient mailbox token, and ciphertext are atomically saved in
+  the encrypted vault. SQLite insertion is idempotent; a crash before or after
+  insertion is recovered from the vault journal without duplicating the queue
+  item. The journal entry is removed only after SQLite accepts the same UUID and
+  payload.
 - `nyx-tor` can flush queued envelopes in order, record an attempt before each
   request, and mark delivery only after the Onion mailbox confirms deposit.
 - The desktop owns an asynchronous worker that validates `NYX_MAILBOX_ONION`,
@@ -86,11 +92,12 @@ not suitable for sensitive or production communication.
   state. The password input is zeroized after each operation; a zeroizing
   in-memory copy remains available while inbound safe-save is active. The location is
   `nyx-desktop-state.nyx` or `NYX_DESKTOP_STATE_PATH` when configured.
-- The workspace currently has twenty-two store/crypto/transport/mailbox/protocol/UI unit tests
+- The workspace currently has twenty-six store/crypto/transport/mailbox/protocol/UI unit tests
   covering MLS group/Welcome/message processing, replay rejection, device
   material validation, request serialization,
   oversized-frame rejection, receipt binding, mailbox lifecycle, cross-mailbox
-  ACK isolation, Onion endpoint validation, snapshot v1 migration, and invalid input rejection.
+  ACK isolation, Onion endpoint validation, snapshot v1/v2 migration, idempotent
+  queue handoff, inbound/outbound safe-save rollback, and invalid input rejection.
 
 ## Not implemented
 
@@ -99,8 +106,8 @@ not suitable for sensitive or production communication.
   two-member demo conversation is recreated on app start.
 - Device identity generation, contact invitations, out-of-band verification,
   and multi-device behavior are not implemented.
-- Initial persistence and outbound ratchet persistence are still manual; inbound
-  processing is automatically safe-saved after Save or Unlock. There is no password
+- Initial persistence is still manual; inbound and configured outbound processing
+  are automatically safe-saved after Save or Unlock. There is no password
   strength meter, operating-system keyring integration, or recovery mechanism.
   Displayed UI history is not part of the MLS snapshot.
 - The generic client SQLite `kv` store remains unencrypted and must not hold
@@ -151,13 +158,13 @@ publication or reachability on the public Tor network.
 
 ## Next milestone
 
-The next useful milestone is coordinated safe-save for outbound ratchet
-advancement and queue insertion. The manual live-Tor smoke test should later
-become an isolated, opt-in CI job.
+The next useful milestone is persistent device identity and a signed contact
+invitation format carrying MLS KeyPackages and directional mailbox capabilities.
+The manual live-Tor smoke test should later become an isolated, opt-in CI job.
 
 ## Resume notes
 
-Start with outbound safe-save coordination.
+Start with persistent device identity and signed contact invitations.
 The desktop transport configuration is:
 
 ```bash
