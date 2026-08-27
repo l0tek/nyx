@@ -28,6 +28,9 @@ pub enum MailboxRequest {
         mailbox_token: [u8; 32],
         receipts: Vec<[u8; 32]>,
     },
+    Health {
+        version: u16,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,6 +45,7 @@ pub enum MailboxResponse {
     Deposited { receipt: [u8; 32] },
     Messages(Vec<StoredEnvelope>),
     Acknowledged { deleted: u16 },
+    Ready { version: u16 },
     Error(MailboxErrorCode),
 }
 
@@ -138,6 +142,20 @@ mod tests {
         };
         let decoded = decode_request(&encode_request(&request).unwrap()).unwrap();
         assert!(matches!(decoded, MailboxRequest::Fetch { limit: 10, .. }));
+    }
+
+    #[test]
+    fn health_request_round_trip() {
+        let request = MailboxRequest::Health {
+            version: PROTOCOL_VERSION,
+        };
+        let decoded = decode_request(&encode_request(&request).unwrap()).unwrap();
+        assert!(matches!(
+            decoded,
+            MailboxRequest::Health {
+                version: PROTOCOL_VERSION
+            }
+        ));
     }
 
     #[test]

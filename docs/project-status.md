@@ -13,7 +13,8 @@ not suitable for sensitive or production communication.
 - The service accepts streams directly on virtual Onion port 443. There is no
   local TCP proxy and no Clearnet fallback.
 - A length-prefixed Postcard protocol supports depositing, fetching, and
-  acknowledging opaque envelopes.
+  acknowledging opaque envelopes, plus a payload-free protocol-version health
+  check that reveals no mailbox capability.
 - SQLite persists only the mailbox token, ciphertext, protocol version,
   timestamps, expiry, and an opaque deterministic receipt. The server does not
   receive or parse message plaintext, contacts, conversation IDs, or sender IDs.
@@ -73,6 +74,10 @@ not suitable for sensitive or production communication.
 - The desktop owns an asynchronous worker that validates `NYX_MAILBOX_ONION`,
   bootstraps Tor without a Clearnet fallback, flushes every ten seconds, keeps
   failures queued, and reports bootstrap/delivery/retry state in the sidebar.
+- The sidebar exposes structured connection state for Tor bootstrap and Onion
+  mailbox reachability, the configured endpoint, health-check latency, delivery
+  detail, and time since the last successful mailbox check. A failed health check
+  prevents deposit/fetch work for that cycle and is retried after ten seconds.
 - With `NYX_LOCAL_MAILBOX_TOKEN_HEX`, the worker also fetches inbound envelopes,
   processes Bob-to-Alice OpenMLS application messages, displays valid UTF-8
   text, and acknowledges only MLS messages that were processed successfully.
@@ -92,7 +97,7 @@ not suitable for sensitive or production communication.
   state. The password input is zeroized after each operation; a zeroizing
   in-memory copy remains available while inbound safe-save is active. The location is
   `nyx-desktop-state.nyx` or `NYX_DESKTOP_STATE_PATH` when configured.
-- The workspace currently has twenty-six store/crypto/transport/mailbox/protocol/UI unit tests
+- The workspace currently has twenty-eight store/crypto/transport/mailbox/protocol/UI unit tests
   covering MLS group/Welcome/message processing, replay rejection, device
   material validation, request serialization,
   oversized-frame rejection, receipt binding, mailbox lifecycle, cross-mailbox

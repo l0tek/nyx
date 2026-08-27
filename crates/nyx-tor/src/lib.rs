@@ -105,6 +105,24 @@ impl TorTransport {
         }
     }
 
+    pub async fn health(&self, endpoint: &OnionEndpoint) -> Result<()> {
+        match self
+            .request(
+                endpoint,
+                &MailboxRequest::Health {
+                    version: nyx_protocol::PROTOCOL_VERSION,
+                },
+            )
+            .await?
+        {
+            MailboxResponse::Ready {
+                version: nyx_protocol::PROTOCOL_VERSION,
+            } => Ok(()),
+            MailboxResponse::Error(code) => bail!("mailbox health check failed: {code:?}"),
+            _ => bail!("mailbox returned an unexpected health response"),
+        }
+    }
+
     pub async fn fetch(
         &self,
         endpoint: &OnionEndpoint,

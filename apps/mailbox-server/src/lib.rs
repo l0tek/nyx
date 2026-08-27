@@ -79,6 +79,14 @@ impl MailboxStore {
                 mailbox_token,
                 receipts,
             } => self.acknowledge(&mut connection, mailbox_token, receipts),
+            MailboxRequest::Health { version } if version == PROTOCOL_VERSION => {
+                Ok(MailboxResponse::Ready {
+                    version: PROTOCOL_VERSION,
+                })
+            }
+            MailboxRequest::Health { .. } => {
+                Ok(MailboxResponse::Error(MailboxErrorCode::InvalidVersion))
+            }
         }
     }
 
@@ -279,6 +287,19 @@ mod tests {
                 limit: 0
             }),
             MailboxResponse::Error(MailboxErrorCode::InvalidLimit)
+        ));
+    }
+
+    #[test]
+    fn health_reports_protocol_readiness() {
+        let store = MailboxStore::open_in_memory(DEFAULT_RETENTION).unwrap();
+        assert!(matches!(
+            store.handle(MailboxRequest::Health {
+                version: PROTOCOL_VERSION
+            }),
+            MailboxResponse::Ready {
+                version: PROTOCOL_VERSION
+            }
         ));
     }
 }

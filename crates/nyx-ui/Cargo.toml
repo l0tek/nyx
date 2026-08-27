@@ -10,6 +10,7 @@ dioxus.workspace = true
 nyx-crypto = { path = "../nyx-crypto" }
 nyx-store = { path = "../nyx-store" }
 nyx-tor = { path = "../nyx-tor" }
+nyx-protocol = { path = "../nyx-protocol" }
 tokio.workspace = true
 zeroize.workspace = true
 dotenvy.workspace = true

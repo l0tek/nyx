@@ -102,6 +102,10 @@ advancement is atomically journaled in the encrypted vault before an idempotent
 handoff to the SQLite delivery queue. Do not replace the crypto boundary with
 ad-hoc cryptography or use the demo for sensitive messaging.
 
+The desktop sidebar performs a payload-free health request through Tor every ten
+seconds and displays Tor bootstrap, Onion mailbox reachability, round-trip time,
+last successful check, and delivery errors separately.
+
 ## Security rule
 
 A compromised delivery server must reveal only opaque mailbox tokens, ciphertext sizes/timing and retention metadata - never plaintext, contact lists, group membership or long-lived user identifiers.

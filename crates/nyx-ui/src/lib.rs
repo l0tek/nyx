@@ -49,6 +49,12 @@ button, input { font: inherit; }
 .vault-result { color: #91abc1; font-size: 11px; margin-top: 9px; overflow-wrap: anywhere; }
 .transport { margin-top: 18px; padding: 12px; border: 1px solid #2a3540; border-radius: 10px; background: #0c1218; }
 .transport-state { margin-top: 6px; color: #91abc1; font-size: 11px; line-height: 1.4; overflow-wrap: anywhere; }
+.connection-line { display: flex; align-items: center; gap: 8px; margin-top: 8px; font-size: 12px; }
+.connection-dot { width: 8px; height: 8px; border-radius: 50%; background: #66717d; }
+.connection-dot.connecting { background: #d8b96e; box-shadow: 0 0 9px #d8b96e; }
+.connection-dot.connected { background: #62c47c; box-shadow: 0 0 9px #62c47c; }
+.connection-dot.degraded { background: #ef7d72; box-shadow: 0 0 9px #ef7d72; }
+.transport-endpoint { margin-top: 6px; color: #6f7d89; font-size: 10px; overflow-wrap: anywhere; }
 @media (max-width: 760px) { .app { grid-template-columns: 1fr; } .sidebar { display: none; } .main { padding: 12px; } .panel { min-height: calc(100vh - 24px); } }
 "#;
 
@@ -58,6 +64,62 @@ struct DisplayMessage {
     ciphertext_size: usize,
     queued: bool,
     incoming: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConnectionPhase {
+    Disabled,
+    Bootstrapping,
+    Connecting,
+    Connected,
+    Degraded,
+}
+
+#[derive(Clone)]
+struct MailboxConnectionStatus {
+    phase: ConnectionPhase,
+    detail: String,
+    endpoint: Option<String>,
+    last_success: Option<Instant>,
+}
+
+impl MailboxConnectionStatus {
+    fn initial() -> Self {
+        Self {
+            phase: ConnectionPhase::Disabled,
+            detail: "NYX_MAILBOX_ONION is not configured".into(),
+            endpoint: None,
+            last_success: None,
+        }
+    }
+
+    fn phase_label(&self) -> &'static str {
+        match self.phase {
+            ConnectionPhase::Disabled => "Disabled",
+            ConnectionPhase::Bootstrapping => "Tor bootstrap",
+            ConnectionPhase::Connecting => "Checking mailbox",
+            ConnectionPhase::Connected => "Mailbox connected",
+            ConnectionPhase::Degraded => "Mailbox unreachable",
+        }
+    }
+
+    fn dot_class(&self) -> &'static str {
+        match self.phase {
+            ConnectionPhase::Disabled => "connection-dot",
+            ConnectionPhase::Bootstrapping | ConnectionPhase::Connecting => {
+                "connection-dot connecting"
+            }
+            ConnectionPhase::Connected => "connection-dot connected",
+            ConnectionPhase::Degraded => "connection-dot degraded",
+        }
+    }
+
+    fn last_success_label(&self) -> String {
+        self.last_success.map_or_else(
+            || "No successful mailbox check yet".into(),
+            |instant| format!("Last successful check {}s ago", instant.elapsed().as_secs()),
+        )
+    }
 }
 
 #[component]
@@ -81,8 +143,7 @@ pub fn App() -> Element {
     });
     let mailbox_token = token_from_environment("NYX_RECIPIENT_MAILBOX_TOKEN_HEX").ok();
     let local_mailbox_token = token_from_environment("NYX_LOCAL_MAILBOX_TOKEN_HEX").ok();
-    let transport_status =
-        use_signal(|| "Tor worker disabled: NYX_MAILBOX_ONION is not set".to_owned());
+    let transport_status = use_signal(MailboxConnectionStatus::initial);
     use_future(move || {
         run_delivery_worker(
             transport_status,
@@ -109,6 +170,8 @@ pub fn App() -> Element {
         .as_ref()
         .map(MlsConversation::member_count)
         .unwrap_or(0);
+    let mailbox_status = transport_status.read().clone();
+    let mailbox_last_success = mailbox_status.last_success_label();
 
     rsx! {
         style { {CSS} }
@@ -130,7 +193,15 @@ pub fn App() -> Element {
                 }
                 div { class: "transport",
                     div { class: "eyebrow", "Tor delivery" }
-                    div { class: "transport-state", "{transport_status}" }
+                    div { class: "connection-line",
+                        span { class: mailbox_status.dot_class() }
+                        strong { "{mailbox_status.phase_label()}" }
+                    }
+                    div { class: "transport-state", "{mailbox_status.detail}" }
+                    div { class: "transport-state", "{mailbox_last_success}" }
+                    if let Some(endpoint) = mailbox_status.endpoint.as_ref() {
+                        div { class: "transport-endpoint", "{endpoint}" }
+                    }
                 }
                 div { class: "vault",
                     div { class: "eyebrow", "Encrypted MLS state" }
@@ -252,7 +323,7 @@ fn token_from_environment(name: &str) -> Result<[u8; 32], String> {
 }
 
 async fn run_delivery_worker(
-    mut status: Signal<String>,
+    mut status: Signal<MailboxConnectionStatus>,
     local_mailbox_token: Option<[u8; 32]>,
     mut conversation: Signal<Result<MlsConversation, String>>,
     mut messages: Signal<Vec<DisplayMessage>>,
@@ -267,7 +338,13 @@ async fn run_delivery_worker(
         Ok(value) => match value.parse::<u16>() {
             Ok(port) => port,
             Err(_) => {
-                status.set("Tor worker disabled: NYX_MAILBOX_PORT is invalid".into());
+                update_connection_status(
+                    &mut status,
+                    ConnectionPhase::Disabled,
+                    "NYX_MAILBOX_PORT is invalid".into(),
+                    Some(host),
+                    false,
+                );
                 return;
             }
         },
@@ -276,53 +353,113 @@ async fn run_delivery_worker(
     let endpoint = match OnionEndpoint::new(host, port) {
         Ok(endpoint) => endpoint,
         Err(error) => {
-            status.set(format!("Tor worker disabled: {error}"));
+            update_connection_status(
+                &mut status,
+                ConnectionPhase::Disabled,
+                format!("Invalid Onion endpoint: {error}"),
+                None,
+                false,
+            );
             return;
         }
     };
     let queue = match DeliveryQueue::open(delivery_queue_path()) {
         Ok(queue) => queue,
         Err(error) => {
-            status.set(format!("Delivery queue unavailable: {error}"));
+            update_connection_status(
+                &mut status,
+                ConnectionPhase::Degraded,
+                format!("Delivery queue unavailable: {error}"),
+                Some(endpoint.host.clone()),
+                false,
+            );
             return;
         }
     };
 
     loop {
-        status.set("Bootstrapping Tor…".into());
+        update_connection_status(
+            &mut status,
+            ConnectionPhase::Bootstrapping,
+            "Building a Tor circuit".into(),
+            Some(endpoint.host.clone()),
+            false,
+        );
         let transport = match TorTransport::bootstrap().await {
             Ok(transport) => transport,
             Err(error) => {
-                status.set(format!("Tor bootstrap failed; retrying: {error}"));
+                update_connection_status(
+                    &mut status,
+                    ConnectionPhase::Degraded,
+                    format!("Tor bootstrap failed; retrying: {error}"),
+                    Some(endpoint.host.clone()),
+                    false,
+                );
                 tokio::time::sleep(Duration::from_secs(15)).await;
                 continue;
             }
         };
-        status.set("Tor ready; watching delivery queue".into());
+        update_connection_status(
+            &mut status,
+            ConnectionPhase::Connecting,
+            "Tor ready; checking Onion mailbox".into(),
+            Some(endpoint.host.clone()),
+            false,
+        );
 
         loop {
+            let health_started = Instant::now();
+            match transport.health(&endpoint).await {
+                Ok(()) => update_connection_status(
+                    &mut status,
+                    ConnectionPhase::Connected,
+                    format!(
+                        "Protocol v{} ready · {} ms",
+                        nyx_protocol::PROTOCOL_VERSION,
+                        health_started.elapsed().as_millis()
+                    ),
+                    Some(endpoint.host.clone()),
+                    true,
+                ),
+                Err(error) => {
+                    update_connection_status(
+                        &mut status,
+                        ConnectionPhase::Degraded,
+                        format!("Mailbox health check failed: {error}"),
+                        Some(endpoint.host.clone()),
+                        false,
+                    );
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    continue;
+                }
+            }
             if !autosave_password.read().is_empty() {
                 match sync_outbound_journal(
                     &mut conversation,
                     &queue,
                     autosave_password.read().as_slice(),
                 ) {
-                    Ok(recovered) if recovered > 0 => status.set(format!(
-                        "Tor ready; recovered {recovered} outbound message(s) into delivery queue"
-                    )),
+                    Ok(recovered) if recovered > 0 => update_connection_detail(
+                        &mut status,
+                        format!("Recovered {recovered} outbound message(s) into delivery queue"),
+                    ),
                     Ok(_) => {}
-                    Err(error) => status.set(format!(
-                        "Outbound journal recovery failed; will retry: {error}"
-                    )),
+                    Err(error) => update_connection_detail(
+                        &mut status,
+                        format!("Outbound journal recovery failed; will retry: {error}"),
+                    ),
                 }
             }
             match transport.flush_delivery_queue(&endpoint, &queue, 32).await {
-                Ok(report) if report.delivered > 0 => status.set(format!(
-                    "Tor ready; delivered {} queued message(s)",
-                    report.delivered
-                )),
-                Ok(_) => status.set("Tor ready; delivery queue is empty".into()),
-                Err(error) => status.set(format!("Delivery failed; queued for retry: {error}")),
+                Ok(report) if report.delivered > 0 => update_connection_detail(
+                    &mut status,
+                    format!("Delivered {} queued message(s)", report.delivered),
+                ),
+                Ok(_) => update_connection_detail(&mut status, "Delivery queue is empty".into()),
+                Err(error) => update_connection_detail(
+                    &mut status,
+                    format!("Delivery failed; queued for retry: {error}"),
+                ),
             }
 
             if let Some(token) = local_mailbox_token {
@@ -378,21 +515,53 @@ async fn run_delivery_worker(
                         }
                         if !receipts.is_empty() {
                             match transport.acknowledge(&endpoint, token, receipts).await {
-                                Ok(deleted) => status.set(format!(
-                                    "Tor ready; received and acknowledged {deleted} message(s)"
-                                )),
-                                Err(error) => status.set(format!(
-                                    "Messages decrypted; mailbox acknowledgement failed: {error}"
-                                )),
+                                Ok(deleted) => update_connection_detail(
+                                    &mut status,
+                                    format!("Received and acknowledged {deleted} message(s)"),
+                                ),
+                                Err(error) => update_connection_detail(
+                                    &mut status,
+                                    format!("Mailbox acknowledgement failed: {error}"),
+                                ),
                             }
                         }
                     }
-                    Err(error) => status.set(format!("Mailbox fetch failed; retrying: {error}")),
+                    Err(error) => update_connection_status(
+                        &mut status,
+                        ConnectionPhase::Degraded,
+                        format!("Mailbox fetch failed; retrying: {error}"),
+                        Some(endpoint.host.clone()),
+                        false,
+                    ),
                 }
             }
             tokio::time::sleep(Duration::from_secs(10)).await;
         }
     }
+}
+
+fn update_connection_status(
+    status: &mut Signal<MailboxConnectionStatus>,
+    phase: ConnectionPhase,
+    detail: String,
+    endpoint: Option<String>,
+    successful: bool,
+) {
+    let last_success = if successful {
+        Some(Instant::now())
+    } else {
+        status.read().last_success
+    };
+    status.set(MailboxConnectionStatus {
+        phase,
+        detail,
+        endpoint,
+        last_success,
+    });
+}
+
+fn update_connection_detail(status: &mut Signal<MailboxConnectionStatus>, detail: String) {
+    status.write().detail = detail;
 }
 
 fn save_session(
