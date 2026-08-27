@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/nyx-core",
+    "crates/nyx-crypto",
+    "crates/nyx-protocol",
+    "crates/nyx-store",
+    "crates/nyx-tor",
+    "crates/nyx-ui",
+    "apps/desktop",
+    "apps/mailbox-server",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.91"
+license = "MIT OR Apache-2.0"
+version = "0.1.0"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
+futures = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+postcard = { version = "1", features = ["alloc"] }
+zeroize = { version = "1", features = ["derive"] }
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+blake3 = "1"
+rusqlite = { version = "0.39", features = ["bundled"] }
+dioxus = { version = "0.7.10", features = ["desktop"] }
+arti-client = { version = "0.45.0", features = ["onion-service-client", "onion-service-service"] }
+tor-hsservice = "0.45.0"
+tor-cell = "0.45.0"
+tor-proto = "0.45.0"
+safelog = "0.9.1"
+openmls = "0.8.1"
+openmls_rust_crypto = "0.5.1"

@@ -1,0 +1,10 @@
+/target
+.DS_Store
+*.db
+*.db-shm
+*.db-wal
+*.key
+*.pem
+*.onion-secret
+.env
+state/
