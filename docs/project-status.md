@@ -32,6 +32,9 @@ not suitable for sensitive or production communication.
 - `nyx-tor` now bootstraps an Arti client, accepts only syntactically valid v3
   `.onion` endpoints, and implements bounded deposit/fetch/ack requests with a
   60-second timeout. It exposes no Clearnet connection method.
+- `nyx-mailbox-smoke` is an opt-in live-Tor test tool. It uses a random mailbox
+  token and random synthetic ciphertext to verify deposit, byte-identical fetch,
+  acknowledgement, and deletion without transmitting user content.
 - Domain types for contacts and chat messages exist.
 - Envelope and encrypted-message serialization exists.
 - SQLite and cryptographic boundary crates exist as scaffolds.
@@ -55,8 +58,9 @@ not suitable for sensitive or production communication.
   tokens, global disk quotas, and production-grade abuse controls are not
   implemented.
 - There is no migration/version-management system for the mailbox database.
-- There are no end-to-end integration tests against the live Tor network, fuzz
-  tests, load tests, backup/restore procedures, deployment manifests, or monitoring.
+- The live-Tor smoke test is manual and has not been automated in CI. There are
+  no parser fuzz tests, load tests, backup/restore procedures, deployment
+  manifests, or monitoring.
 
 ## Security limitations
 
@@ -88,7 +92,7 @@ publication or reachability on the public Tor network.
 
 ## Next milestone
 
-The next useful milestone is an opt-in end-to-end test that launches a mailbox
-Onion Service and exercises the implemented `nyx-tor` deposit/fetch/ack client
-over Tor. OpenMLS identity, group, and persistence integration must then precede
-wiring real message content into the desktop UI.
+The next useful milestone is OpenMLS identity, group, and persistence
+integration with deterministic local tests. That must precede wiring real
+message content into the transport or desktop UI. The manual live-Tor smoke test
+should later become an isolated, opt-in CI job.

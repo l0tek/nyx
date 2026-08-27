@@ -1,0 +1,13 @@
+[package]
+name = "nyx-mailbox-smoke"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tokio.workspace = true
+rand.workspace = true
+nyx-protocol = { path = "../../crates/nyx-protocol" }
+nyx-tor = { path = "../../crates/nyx-tor" }

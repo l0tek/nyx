@@ -4797,6 +4797,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "nyx-mailbox-smoke"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "nyx-protocol",
+ "nyx-tor",
+ "rand 0.8.8",
+ "tokio",
+]
+
+[[package]]
 name = "nyx-protocol"
 version = "0.1.0"
 dependencies = [

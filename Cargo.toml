@@ -9,6 +9,7 @@ members = [
     "crates/nyx-ui",
     "apps/desktop",
     "apps/mailbox-server",
+    "apps/mailbox-smoke",
 ]
 
 [workspace.package]
@@ -39,5 +40,6 @@ tor-cell = "0.45.0"
 tor-proto = "0.45.0"
 safelog = "0.9.1"
 tor-rtcompat = "0.45.0"
+rand = "0.8"
 openmls = "0.8.1"
 openmls_rust_crypto = "0.5.1"

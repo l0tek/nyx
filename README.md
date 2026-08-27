@@ -60,6 +60,17 @@ local or Clearnet TCP listener. Opaque envelopes are retained for seven days in
 `nyx-mailbox-data/mailbox.sqlite3` by default. Override that directory with
 `NYX_MAILBOX_DATA_DIR`.
 
+With the server running and its printed address available, exercise the complete
+mailbox flow from another terminal:
+
+```bash
+cargo run -p nyx-mailbox-smoke -- <v3-address.onion>
+```
+
+The opt-in smoke test generates a fresh random mailbox token and random synthetic
+ciphertext, then verifies deposit, fetch, and acknowledgement over Tor. It does
+not use real message content and deletes its test envelope on success.
+
 See [`docs/project-status.md`](docs/project-status.md) for implemented features,
 known limitations, and the remaining security work.
 
