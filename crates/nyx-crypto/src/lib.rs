@@ -60,6 +60,31 @@ pub struct IssuedInvitation {
     pub expires_unix_ms: i64,
 }
 
+#[derive(Clone, Debug, SerdeSerialize, SerdeDeserialize, PartialEq, Eq)]
+pub struct RemoteSession {
+    pub invitation_id: Uuid,
+    pub contact_device_id: Uuid,
+    pub group_id: Vec<u8>,
+}
+
+#[derive(Clone, Debug, SerdeSerialize, SerdeDeserialize)]
+pub struct InvitationAcceptancePayload {
+    pub version: u16,
+    pub invitation_id: Uuid,
+    pub accepter_device_id: Uuid,
+    pub accepter_display_name: String,
+    pub accepter_identity_public_key: [u8; 32],
+    pub accepter_mls_key_package: Vec<u8>,
+    pub mailbox_onion: String,
+    pub welcome: Vec<u8>,
+}
+
+#[derive(Clone, Debug, SerdeSerialize, SerdeDeserialize)]
+pub struct SignedInvitationAcceptance {
+    pub payload: InvitationAcceptancePayload,
+    pub signature: Vec<u8>,
+}
+
 #[derive(Clone, Debug, SerdeSerialize, SerdeDeserialize)]
 pub struct ContactInvitationPayload {
     pub version: u16,
@@ -95,6 +120,49 @@ struct DeviceIdentitySnapshot {
     mls_key_package: Vec<u8>,
     contacts: Vec<ContactRecord>,
     issued_invitations: Vec<IssuedInvitation>,
+    #[serde(default)]
+    sessions: Vec<RemoteSession>,
+    #[serde(default)]
+    remote_inbound_receipts: Vec<InboundReceipt>,
+    #[serde(default)]
+    remote_pending_outbound: Vec<PendingOutbound>,
+}
+
+// Snapshot layout used before remote MLS sessions were added. Postcard encodes
+// structs positionally and cannot apply serde defaults when an older payload
+// ends before newly appended fields, so this layout is required for migration.
+#[derive(SerdeSerialize, SerdeDeserialize)]
+struct LegacyDeviceIdentitySnapshot {
+    version: u16,
+    device_id: Uuid,
+    display_name: String,
+    identity_secret_key: [u8; 32],
+    identity_public_key: [u8; 32],
+    mls_signature_key: Vec<u8>,
+    mls_storage: HashMap<Vec<u8>, Vec<u8>>,
+    mls_key_package: Vec<u8>,
+    contacts: Vec<ContactRecord>,
+    issued_invitations: Vec<IssuedInvitation>,
+}
+
+impl From<LegacyDeviceIdentitySnapshot> for DeviceIdentitySnapshot {
+    fn from(legacy: LegacyDeviceIdentitySnapshot) -> Self {
+        Self {
+            version: legacy.version,
+            device_id: legacy.device_id,
+            display_name: legacy.display_name,
+            identity_secret_key: legacy.identity_secret_key,
+            identity_public_key: legacy.identity_public_key,
+            mls_signature_key: legacy.mls_signature_key,
+            mls_storage: legacy.mls_storage,
+            mls_key_package: legacy.mls_key_package,
+            contacts: legacy.contacts,
+            issued_invitations: legacy.issued_invitations,
+            sessions: Vec::new(),
+            remote_inbound_receipts: Vec::new(),
+            remote_pending_outbound: Vec::new(),
+        }
+    }
 }
 
 pub struct DeviceIdentity {
@@ -119,6 +187,8 @@ impl Drop for DeviceIdentitySnapshot {
             invitation.inviter_receive_token.zeroize();
             invitation.invitee_receive_token.zeroize();
         }
+        self.remote_inbound_receipts.zeroize();
+        self.remote_pending_outbound.clear();
     }
 }
 
@@ -149,6 +219,9 @@ impl DeviceIdentity {
                 mls_key_package,
                 contacts: Vec::new(),
                 issued_invitations: Vec::new(),
+                sessions: Vec::new(),
+                remote_inbound_receipts: Vec::new(),
+                remote_pending_outbound: Vec::new(),
             },
         })
     }
@@ -167,6 +240,28 @@ impl DeviceIdentity {
 
     pub fn contacts(&self) -> &[ContactRecord] {
         &self.snapshot.contacts
+    }
+
+    pub fn sessions(&self) -> &[RemoteSession] {
+        &self.snapshot.sessions
+    }
+
+    pub fn has_session(&self, device_id: Uuid) -> bool {
+        self.snapshot
+            .sessions
+            .iter()
+            .any(|session| session.contact_device_id == device_id)
+    }
+
+    pub fn has_remote_inbound_receipt(&self, receipt: &[u8; 32]) -> bool {
+        self.snapshot
+            .remote_inbound_receipts
+            .iter()
+            .any(|entry| &entry.receipt == receipt)
+    }
+
+    pub fn remote_pending_outbound(&self) -> Vec<PendingOutbound> {
+        self.snapshot.remote_pending_outbound.clone()
     }
 
     pub fn create_invitation(&mut self, mailbox_onion: impl Into<String>) -> Result<String> {
@@ -303,6 +398,317 @@ impl DeviceIdentity {
         Ok(())
     }
 
+    /// Accept an imported invitation, create the two-member MLS group and
+    /// return a signed Welcome response ready for opaque mailbox transport.
+    pub fn accept_invitation(&mut self, device_id: Uuid) -> Result<Vec<u8>> {
+        if self.has_session(device_id) {
+            bail!("an MLS session with this contact already exists");
+        }
+        let contact = self
+            .snapshot
+            .contacts
+            .iter()
+            .find(|contact| contact.device_id == device_id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("contact does not exist"))?;
+        let provider = provider_from_storage(self.snapshot.mls_storage.clone())?;
+        let signer = read_signer(&provider, &self.snapshot.mls_signature_key)?;
+        let credential = CredentialWithKey {
+            credential: BasicCredential::new(self.snapshot.device_id.as_bytes().to_vec()).into(),
+            signature_key: signer.to_public_vec().into(),
+        };
+        let create_config = MlsGroupCreateConfig::builder()
+            .ciphersuite(NYX_CIPHERSUITE)
+            .use_ratchet_tree_extension(true)
+            .build();
+        let mut group = MlsGroup::new(&provider, &signer, &create_config, credential)
+            .map_err(|error| anyhow::anyhow!("create remote MLS group: {error:?}"))?;
+        let key_package =
+            openmls::prelude::KeyPackageIn::tls_deserialize_exact(contact.mls_key_package.clone())
+                .map_err(|error| anyhow::anyhow!("deserialize contact MLS KeyPackage: {error:?}"))?
+                .validate(provider.crypto(), openmls::prelude::ProtocolVersion::Mls10)
+                .map_err(|error| anyhow::anyhow!("validate contact MLS KeyPackage: {error:?}"))?;
+        let (_, welcome, _) = group
+            .add_members(&provider, &signer, &[key_package])
+            .map_err(|error| anyhow::anyhow!("add remote MLS member: {error:?}"))?;
+        group
+            .merge_pending_commit(&provider)
+            .map_err(|error| anyhow::anyhow!("merge remote MLS add commit: {error:?}"))?;
+        let welcome = welcome
+            .to_bytes()
+            .map_err(|error| anyhow::anyhow!("serialize remote MLS Welcome: {error:?}"))?;
+        let payload = InvitationAcceptancePayload {
+            version: INVITATION_VERSION,
+            invitation_id: contact.invitation_id,
+            accepter_device_id: self.snapshot.device_id,
+            accepter_display_name: self.snapshot.display_name.clone(),
+            accepter_identity_public_key: self.snapshot.identity_public_key,
+            accepter_mls_key_package: self.snapshot.mls_key_package.clone(),
+            mailbox_onion: contact.mailbox_onion,
+            welcome,
+        };
+        let encoded_payload = postcard::to_allocvec(&payload).context("serialize acceptance")?;
+        let signature = SigningKey::from_bytes(&self.snapshot.identity_secret_key)
+            .sign(&encoded_payload)
+            .to_bytes()
+            .to_vec();
+        let group_id = group.group_id().as_slice().to_vec();
+        self.snapshot.mls_storage = clone_storage(&provider)?;
+        self.snapshot.sessions.push(RemoteSession {
+            invitation_id: payload.invitation_id,
+            contact_device_id: device_id,
+            group_id,
+        });
+        postcard::to_allocvec(&SignedInvitationAcceptance { payload, signature })
+            .context("serialize signed invitation acceptance")
+    }
+
+    /// Verify a signed acceptance for one of our issued invitations and join
+    /// the MLS group using the private KeyPackage material in this identity.
+    pub fn process_invitation_acceptance(&mut self, encoded: &[u8]) -> Result<ContactRecord> {
+        let acceptance: SignedInvitationAcceptance =
+            postcard::from_bytes(encoded).context("deserialize invitation acceptance")?;
+        let payload = &acceptance.payload;
+        if payload.version != INVITATION_VERSION {
+            bail!("invitation acceptance version is unsupported");
+        }
+        validate_display_name(payload.accepter_display_name.clone())?;
+        validate_onion_address(payload.mailbox_onion.clone())?;
+        let issued = self
+            .issued_invitation(payload.invitation_id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("acceptance references an unknown invitation"))?;
+        if issued.expires_unix_ms <= unix_time_ms()? {
+            bail!("acceptance references an expired invitation");
+        }
+        if self.has_session(payload.accepter_device_id) {
+            return self
+                .snapshot
+                .contacts
+                .iter()
+                .find(|contact| contact.device_id == payload.accepter_device_id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("existing MLS session has no contact"));
+        }
+        let key = VerifyingKey::from_bytes(&payload.accepter_identity_public_key)
+            .context("acceptance identity key is invalid")?;
+        let signature: [u8; 64] = acceptance
+            .signature
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("acceptance signature has invalid length"))?;
+        key.verify(
+            &postcard::to_allocvec(payload).context("serialize acceptance")?,
+            &Signature::from_bytes(&signature),
+        )
+        .context("invitation acceptance signature verification failed")?;
+        let provider = provider_from_storage(self.snapshot.mls_storage.clone())?;
+        let accepter_key_package = openmls::prelude::KeyPackageIn::tls_deserialize_exact(
+            payload.accepter_mls_key_package.clone(),
+        )
+        .map_err(|error| anyhow::anyhow!("deserialize accepter MLS KeyPackage: {error:?}"))?
+        .validate(provider.crypto(), openmls::prelude::ProtocolVersion::Mls10)
+        .map_err(|error| anyhow::anyhow!("validate accepter MLS KeyPackage: {error:?}"))?;
+        if accepter_key_package.ciphersuite() != NYX_CIPHERSUITE {
+            bail!("invitation acceptance uses an unsupported MLS ciphersuite");
+        }
+        let message = MlsMessageIn::tls_deserialize_exact(payload.welcome.clone())
+            .map_err(|error| anyhow::anyhow!("deserialize MLS Welcome: {error:?}"))?;
+        let MlsMessageBodyIn::Welcome(welcome) = message.extract() else {
+            bail!("invitation acceptance does not contain an MLS Welcome");
+        };
+        let join_config = MlsGroupJoinConfig::builder()
+            .use_ratchet_tree_extension(true)
+            .build();
+        let group = StagedWelcome::new_from_welcome(&provider, &join_config, welcome, None)
+            .map_err(|error| anyhow::anyhow!("process remote MLS Welcome: {error:?}"))?
+            .into_group(&provider)
+            .map_err(|error| anyhow::anyhow!("join remote MLS group: {error:?}"))?;
+        let contact = ContactRecord {
+            invitation_id: payload.invitation_id,
+            device_id: payload.accepter_device_id,
+            display_name: payload.accepter_display_name.clone(),
+            identity_public_key: payload.accepter_identity_public_key,
+            identity_fingerprint: fingerprint(&payload.accepter_identity_public_key),
+            mls_key_package: payload.accepter_mls_key_package.clone(),
+            mailbox_onion: payload.mailbox_onion.clone(),
+            send_mailbox_token: issued.invitee_receive_token,
+            receive_mailbox_token: issued.inviter_receive_token,
+            verified: false,
+        };
+        self.snapshot.mls_storage = clone_storage(&provider)?;
+        self.snapshot.sessions.push(RemoteSession {
+            invitation_id: payload.invitation_id,
+            contact_device_id: payload.accepter_device_id,
+            group_id: group.group_id().as_slice().to_vec(),
+        });
+        self.snapshot.contacts.push(contact.clone());
+        Ok(contact)
+    }
+
+    pub fn encrypt_for_contact(&mut self, device_id: Uuid, plaintext: &[u8]) -> Result<Vec<u8>> {
+        if plaintext.is_empty() {
+            bail!("MLS application message must not be empty");
+        }
+        let session = self
+            .snapshot
+            .sessions
+            .iter()
+            .find(|session| session.contact_device_id == device_id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("remote MLS session is not established"))?;
+        let provider = provider_from_storage(self.snapshot.mls_storage.clone())?;
+        let signer = read_signer(&provider, &self.snapshot.mls_signature_key)?;
+        let group_id = openmls::prelude::GroupId::from_slice(&session.group_id);
+        let mut group = MlsGroup::load(provider.storage(), &group_id)
+            .map_err(|error| anyhow::anyhow!("load remote MLS group: {error:?}"))?
+            .ok_or_else(|| anyhow::anyhow!("remote MLS group is missing"))?;
+        let ciphertext = group
+            .create_message(&provider, &signer, plaintext)
+            .map_err(|error| anyhow::anyhow!("encrypt remote MLS message: {error:?}"))?
+            .to_bytes()
+            .map_err(|error| anyhow::anyhow!("serialize remote MLS message: {error:?}"))?;
+        self.snapshot.mls_storage = clone_storage(&provider)?;
+        Ok(ciphertext)
+    }
+
+    pub fn decrypt_from_contact(&mut self, device_id: Uuid, ciphertext: &[u8]) -> Result<Vec<u8>> {
+        let session = self
+            .snapshot
+            .sessions
+            .iter()
+            .find(|session| session.contact_device_id == device_id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("remote MLS session is not established"))?;
+        let provider = provider_from_storage(self.snapshot.mls_storage.clone())?;
+        let group_id = openmls::prelude::GroupId::from_slice(&session.group_id);
+        let mut group = MlsGroup::load(provider.storage(), &group_id)
+            .map_err(|error| anyhow::anyhow!("load remote MLS group: {error:?}"))?
+            .ok_or_else(|| anyhow::anyhow!("remote MLS group is missing"))?;
+        let message = MlsMessageIn::tls_deserialize_exact(ciphertext)
+            .map_err(|error| anyhow::anyhow!("deserialize remote MLS message: {error:?}"))?
+            .try_into_protocol_message()
+            .map_err(|error| anyhow::anyhow!("expected an MLS protocol message: {error:?}"))?;
+        let processed = group
+            .process_message(&provider, message)
+            .map_err(|error| anyhow::anyhow!("decrypt remote MLS message: {error:?}"))?;
+        let ProcessedMessageContent::ApplicationMessage(message) = processed.into_content() else {
+            bail!("received MLS message is not application data");
+        };
+        self.snapshot.mls_storage = clone_storage(&provider)?;
+        Ok(message.into_bytes())
+    }
+
+    pub fn process_remote_inbound_and_save(
+        &mut self,
+        device_id: Uuid,
+        ciphertext: &[u8],
+        receipt: [u8; 32],
+        expires_unix_ms: i64,
+        path: impl AsRef<Path>,
+        password: &[u8],
+    ) -> Result<Vec<u8>> {
+        if self.has_remote_inbound_receipt(&receipt) {
+            bail!("inbound mailbox receipt was already processed");
+        }
+        let before = postcard::to_allocvec(&self.snapshot).context("snapshot device identity")?;
+        let plaintext = self.decrypt_from_contact(device_id, ciphertext)?;
+        let now = unix_time_ms()?;
+        self.snapshot
+            .remote_inbound_receipts
+            .retain(|entry| entry.expires_unix_ms > now);
+        if self.snapshot.remote_inbound_receipts.len() >= MAX_INBOUND_RECEIPTS {
+            self.snapshot = postcard::from_bytes(&before).context("restore device identity")?;
+            bail!("remote inbound receipt journal is full");
+        }
+        self.snapshot.remote_inbound_receipts.push(InboundReceipt {
+            receipt,
+            expires_unix_ms,
+        });
+        if let Err(error) = self.save_encrypted(path, password) {
+            self.snapshot = postcard::from_bytes(&before)
+                .context("restore device identity after failed inbound safe-save")?;
+            return Err(error);
+        }
+        Ok(plaintext)
+    }
+
+    pub fn create_remote_outbound_and_save(
+        &mut self,
+        device_id: Uuid,
+        plaintext: &[u8],
+        mailbox_token: [u8; 32],
+        path: impl AsRef<Path>,
+        password: &[u8],
+    ) -> Result<PendingOutbound> {
+        if self.snapshot.remote_pending_outbound.len() >= MAX_OUTBOUND_JOURNAL {
+            bail!("remote outbound journal is full");
+        }
+        let before = postcard::to_allocvec(&self.snapshot).context("snapshot device identity")?;
+        let mls_ciphertext = self.encrypt_for_contact(device_id, plaintext)?;
+        let ciphertext =
+            nyx_protocol::encode_client_payload(&nyx_protocol::ClientPayload::MlsApplication {
+                sender_device: self.snapshot.device_id,
+                ciphertext: mls_ciphertext,
+            })
+            .map_err(|error| anyhow::anyhow!("serialize remote client payload: {error}"))?;
+        let pending = PendingOutbound {
+            id: Uuid::new_v4(),
+            mailbox_token,
+            ciphertext,
+        };
+        self.snapshot.remote_pending_outbound.push(pending.clone());
+        if let Err(error) = self.save_encrypted(path, password) {
+            self.snapshot = postcard::from_bytes(&before)
+                .context("restore device identity after failed outbound safe-save")?;
+            return Err(error);
+        }
+        Ok(pending)
+    }
+
+    pub fn journal_remote_payload_and_save(
+        &mut self,
+        ciphertext: Vec<u8>,
+        mailbox_token: [u8; 32],
+        path: impl AsRef<Path>,
+        password: &[u8],
+    ) -> Result<PendingOutbound> {
+        if self.snapshot.remote_pending_outbound.len() >= MAX_OUTBOUND_JOURNAL {
+            bail!("remote outbound journal is full");
+        }
+        let pending = PendingOutbound {
+            id: Uuid::new_v4(),
+            mailbox_token,
+            ciphertext,
+        };
+        self.snapshot.remote_pending_outbound.push(pending.clone());
+        if let Err(error) = self.save_encrypted(path, password) {
+            self.snapshot.remote_pending_outbound.pop();
+            return Err(error);
+        }
+        Ok(pending)
+    }
+
+    pub fn mark_remote_outbound_queued_and_save(
+        &mut self,
+        id: Uuid,
+        path: impl AsRef<Path>,
+        password: &[u8],
+    ) -> Result<()> {
+        let index = self
+            .snapshot
+            .remote_pending_outbound
+            .iter()
+            .position(|pending| pending.id == id)
+            .ok_or_else(|| anyhow::anyhow!("remote outbound journal entry does not exist"))?;
+        let pending = self.snapshot.remote_pending_outbound.remove(index);
+        if let Err(error) = self.save_encrypted(path, password) {
+            self.snapshot.remote_pending_outbound.insert(index, pending);
+            return Err(error);
+        }
+        Ok(())
+    }
+
     pub fn save_encrypted(&self, path: impl AsRef<Path>, password: &[u8]) -> Result<()> {
         let encoded = Zeroizing::new(
             postcard::to_allocvec(&self.snapshot).context("serialize device identity")?,
@@ -314,8 +720,13 @@ impl DeviceIdentity {
     pub fn load_encrypted(path: impl AsRef<Path>, password: &[u8]) -> Result<Self> {
         let encoded = nyx_store::EncryptedBlobStore::load(path, password)
             .context("load encrypted device identity")?;
-        let snapshot: DeviceIdentitySnapshot =
-            postcard::from_bytes(&encoded).context("deserialize device identity")?;
+        let snapshot: DeviceIdentitySnapshot = postcard::from_bytes(&encoded)
+            .or_else(|error| {
+                postcard::from_bytes::<LegacyDeviceIdentitySnapshot>(&encoded)
+                    .map(Into::into)
+                    .map_err(|_| error)
+            })
+            .context("deserialize device identity")?;
         if snapshot.version != DEVICE_SNAPSHOT_VERSION {
             bail!("device identity version is unsupported");
         }
@@ -1218,6 +1629,32 @@ mod tests {
     }
 
     #[test]
+    fn loads_identity_snapshot_created_before_remote_sessions() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("legacy-identity.nyx");
+        let identity = DeviceIdentity::generate("Alice").unwrap();
+        let legacy = LegacyDeviceIdentitySnapshot {
+            version: identity.snapshot.version,
+            device_id: identity.snapshot.device_id,
+            display_name: identity.snapshot.display_name.clone(),
+            identity_secret_key: identity.snapshot.identity_secret_key,
+            identity_public_key: identity.snapshot.identity_public_key,
+            mls_signature_key: identity.snapshot.mls_signature_key.clone(),
+            mls_storage: identity.snapshot.mls_storage.clone(),
+            mls_key_package: identity.snapshot.mls_key_package.clone(),
+            contacts: identity.snapshot.contacts.clone(),
+            issued_invitations: identity.snapshot.issued_invitations.clone(),
+        };
+        let encoded = postcard::to_allocvec(&legacy).unwrap();
+        nyx_store::EncryptedBlobStore::save(&path, b"strong local password", &encoded).unwrap();
+
+        let restored = DeviceIdentity::load_encrypted(&path, b"strong local password").unwrap();
+        assert_eq!(restored.device_id(), identity.device_id());
+        assert!(restored.sessions().is_empty());
+        assert!(restored.remote_pending_outbound().is_empty());
+    }
+
+    #[test]
     fn signed_contact_invitation_verifies_key_package_and_directions() {
         let mut alice = DeviceIdentity::generate("Alice").unwrap();
         let invitation = alice
@@ -1270,5 +1707,44 @@ mod tests {
         assert_eq!(restored.contacts().len(), 1);
         assert!(restored.contacts()[0].verified);
         assert_eq!(restored.contacts()[0].device_id, alice.device_id());
+    }
+
+    #[test]
+    fn signed_acceptance_establishes_persistent_remote_mls_session() {
+        let onion = "25njqamcweflpvkl73j4szahhihoc4xt3ktcgjnpaingr5yhkenl5sid.onion";
+        let mut alice = DeviceIdentity::generate("Alice").unwrap();
+        let invitation = alice.create_invitation(onion).unwrap();
+        let mut bob = DeviceIdentity::generate("Bob").unwrap();
+        bob.import_invitation(&invitation).unwrap();
+
+        let acceptance = bob.accept_invitation(alice.device_id()).unwrap();
+        let bob_contact = alice.process_invitation_acceptance(&acceptance).unwrap();
+        assert!(alice.has_session(bob.device_id()));
+        assert!(bob.has_session(alice.device_id()));
+        assert_eq!(
+            bob.contacts()[0].send_mailbox_token,
+            bob_contact.receive_mailbox_token
+        );
+        assert_eq!(
+            bob.contacts()[0].receive_mailbox_token,
+            bob_contact.send_mailbox_token
+        );
+
+        let encrypted = bob
+            .encrypt_for_contact(alice.device_id(), b"hello alice")
+            .unwrap();
+        assert_eq!(
+            alice
+                .decrypt_from_contact(bob.device_id(), &encrypted)
+                .unwrap(),
+            b"hello alice"
+        );
+        let reply = alice
+            .encrypt_for_contact(bob.device_id(), b"hello bob")
+            .unwrap();
+        assert_eq!(
+            bob.decrypt_from_contact(alice.device_id(), &reply).unwrap(),
+            b"hello bob"
+        );
     }
 }

@@ -44,6 +44,19 @@ not suitable for sensitive or production communication.
   MLS KeyPackage signature/lifetime/ciphersuite, duplicate device IDs, and size
   bounds. Each invitation contains separate random 256-bit capabilities for
   inviter-bound and invitee-bound traffic.
+- A verified contact can now accept an invitation in the desktop UI. The
+  accepting device creates a real two-member OpenMLS group, adds the inviter's
+  persisted KeyPackage, merges the Add commit, and signs a response containing
+  the MLS Welcome with its persistent Ed25519 device identity.
+- The invitation acceptance and subsequent MLS application messages use a
+  typed client-to-client payload which remains opaque to the mailbox server.
+  The inviter verifies the acceptance signature, matches it to an outstanding
+  invitation, creates the reverse directional contact, and joins the group
+  from the Welcome using its persisted private KeyPackage material.
+- Remote 1:1 group identifiers and complete OpenMLS provider state are stored
+  in the encrypted device identity. The desktop shows whether the selected
+  contact has an active MLS session and enables messaging only after both
+  fingerprint verification and session establishment.
 - `nyx-tor` now bootstraps an Arti client, accepts only syntactically valid v3
   `.onion` endpoints, and implements bounded deposit/fetch/ack requests with a
   60-second timeout. It exposes no Clearnet connection method.
@@ -80,6 +93,10 @@ not suitable for sensitive or production communication.
   insertion is recovered from the vault journal without duplicating the queue
   item. The journal entry is removed only after SQLite accepts the same UUID and
   payload.
+- The same encrypted-journal handoff now protects signed Welcome responses and
+  remote-contact messages. Remote inbound receipt journals are persisted with
+  the advanced ratchet before mailbox acknowledgement, so an ACK retry does not
+  replay an MLS PrivateMessage.
 - `nyx-tor` can flush queued envelopes in order, record an attempt before each
   request, and mark delivery only after the Onion mailbox confirms deposit.
 - The desktop owns an asynchronous worker that validates `NYX_MAILBOX_ONION`,
@@ -109,23 +126,20 @@ not suitable for sensitive or production communication.
   available while safe-save is active. Identity defaults to
   `nyx-device-identity.nyx` (`NYX_DEVICE_IDENTITY_PATH`), while MLS state remains
   `nyx-desktop-state.nyx` (`NYX_DESKTOP_STATE_PATH`).
-- The workspace currently has thirty-three store/crypto/transport/mailbox/protocol/UI unit tests
+- The workspace currently has thirty-five store/crypto/transport/mailbox/protocol/UI unit tests
   covering MLS group/Welcome/message processing, replay rejection, device
   material validation, request serialization,
   oversized-frame rejection, receipt binding, mailbox lifecycle, cross-mailbox
   ACK isolation, Onion endpoint validation, snapshot v1/v2 migration, idempotent
   queue handoff, inbound/outbound safe-save rollback, legacy response-discriminant
   compatibility, persistent identity reload, signed invitation tamper rejection,
-  MLS KeyPackage validation, directional token mapping, and invalid input rejection.
+  MLS KeyPackage validation, directional token mapping, signed acceptance,
+  bidirectional remote MLS exchange, and invalid input rejection.
 
 ## Not implemented
 
-- Remote contact session establishment is not implemented yet: invitation
-  KeyPackages are validated and persisted, but Add/Commit/Welcome transport and
-  the remote-only MLS conversation model still need implementation. Messaging to
-  imported contacts is deliberately disabled instead of reusing the local demo ratchet.
 - General group lifecycle operations, remote commit handling, removals, updates,
-  invitation acceptance responses, and multi-device behavior are not implemented.
+  KeyPackage rotation, invitation revocation, and multi-device behavior are not implemented.
 - Initial persistence is still manual; inbound and configured outbound processing
   are automatically safe-saved after Save or Unlock. There is no password
   strength meter, operating-system keyring integration, or recovery mechanism.
@@ -178,13 +192,13 @@ publication or reachability on the public Tor network.
 
 ## Next milestone
 
-The next useful milestone is invitation acceptance with MLS Add/Commit/Welcome
-delivery, producing a real remote 1:1 conversation from the persisted KeyPackage.
-The manual live-Tor smoke test should later become an isolated, opt-in CI job.
+The next useful milestone is durable encrypted message history plus MLS update,
+removal, and KeyPackage-rotation handling. A two-desktop live-Tor acceptance and
+chat scenario should also become an isolated, opt-in integration test.
 
 ## Resume notes
 
-Start with invitation acceptance and remote MLS Welcome delivery.
+Start with encrypted per-contact history and remote MLS commit lifecycle handling.
 The desktop transport configuration is:
 
 ```bash

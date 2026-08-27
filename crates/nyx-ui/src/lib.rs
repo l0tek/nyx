@@ -1,5 +1,6 @@
 use dioxus::prelude::*;
 use nyx_crypto::{ContactRecord, DeviceIdentity, MlsConversation};
+use nyx_protocol::{ClientPayload, decode_client_payload, encode_client_payload};
 use nyx_store::DeliveryQueue;
 use nyx_tor::{OnionEndpoint, TorTransport};
 use std::{
@@ -176,6 +177,7 @@ pub fn App() -> Element {
             transport_status,
             local_mailbox_token,
             conversation,
+            identity,
             messages,
             last_error,
             autosave_password,
@@ -217,6 +219,16 @@ pub fn App() -> Element {
         .iter()
         .find(|contact| Some(contact.device_id) == *selected_contact.read())
         .cloned();
+    let remote_session_ready = active_contact.as_ref().is_some_and(|contact| {
+        identity
+            .read()
+            .as_ref()
+            .ok()
+            .and_then(Option::as_ref)
+            .is_some_and(|identity| identity.has_session(contact.device_id))
+    });
+    let keydown_contact = active_contact.clone();
+    let click_contact = active_contact.clone();
 
     rsx! {
         style { {CSS} }
@@ -321,7 +333,7 @@ pub fn App() -> Element {
                             h2 { if let Some(contact) = active_contact.as_ref() { "{contact.display_name}" } else { "Contact setup" } }
                             div { class: "subtle", "Persistent Ed25519 identity · OpenMLS KeyPackage" }
                         }
-                        span { class: "badge", if mls_ready { "Device ready" } else { "Locked" } }
+                        span { class: "badge", if remote_session_ready { "MLS session active" } else if mls_ready { "Device ready" } else { "Locked" } }
                     }
                     div { class: "contact-tools",
                         div {
@@ -359,7 +371,7 @@ pub fn App() -> Element {
                                 h3 { "{contact.display_name}" }
                                 p { "Signed invitation and MLS KeyPackage imported. Compare this fingerprint out of band before establishing a remote MLS session:" }
                                 div { class: "fingerprint", "{contact.identity_fingerprint}" }
-                                p { if contact.verified { "Identity marked as verified." } else { "Remote MLS session establishment is the next protocol step; messaging remains disabled to avoid using the local demo ratchet with a real contact." } }
+                                p { if remote_session_ready { "The signed MLS Welcome was processed. This remote session is ready." } else if contact.verified { "Identity verified. Accept the invitation to create the MLS session and send its signed Welcome." } else { "Verify the identity fingerprint before accepting this invitation." } }
                                 if !contact.verified {
                                     button {
                                         class: "mini-button",
@@ -368,6 +380,16 @@ pub fn App() -> Element {
                                             move |_| verify_contact_fingerprint(&mut identity, device_id, autosave_password, &mut contact_status)
                                         },
                                         "I compared this fingerprint"
+                                    }
+                                }
+                                if contact.verified && !remote_session_ready {
+                                    button {
+                                        class: "mini-button",
+                                        onclick: {
+                                            let device_id = contact.device_id;
+                                            move |_| accept_contact_invitation(&mut identity, device_id, autosave_password, &delivery_queue, &mut contact_status)
+                                        },
+                                        "Accept & send MLS Welcome"
                                     }
                                 }
                             }
@@ -394,8 +416,8 @@ pub fn App() -> Element {
                     div { class: "composer",
                         input {
                             value: "{draft}",
-                            placeholder: if active_contact.is_some() { "Remote MLS session setup pending" } else { "Select a contact" },
-                            disabled: true,
+                            placeholder: if remote_session_ready { "Write an end-to-end encrypted message" } else if active_contact.is_some() { "Verify contact and establish MLS session" } else { "Select a contact" },
+                            disabled: !remote_session_ready || !active_contact.as_ref().is_some_and(|contact| contact.verified),
                             oninput: move |event| {
                                 draft.set(event.value());
                                 touch_vault(&mut vault_last_activity, &autosave_password);
@@ -403,15 +425,19 @@ pub fn App() -> Element {
                             onkeydown: move |event| {
                                 if event.key() == Key::Enter {
                                     touch_vault(&mut vault_last_activity, &autosave_password);
-                                    send_message(&mut conversation, &delivery_queue, recipient_mailbox_token, &mut draft, &mut messages, &mut last_error, &autosave_password);
+                                    if let Some(contact) = keydown_contact.as_ref() {
+                                        send_remote_message(&mut identity, contact, &delivery_queue, &mut draft, &mut messages, &mut last_error, &autosave_password);
+                                    }
                                 }
                             }
                         }
                         button {
-                            disabled: true,
+                            disabled: !remote_session_ready || !active_contact.as_ref().is_some_and(|contact| contact.verified),
                             onclick: move |_| {
                                 touch_vault(&mut vault_last_activity, &autosave_password);
-                                send_message(&mut conversation, &delivery_queue, recipient_mailbox_token, &mut draft, &mut messages, &mut last_error, &autosave_password);
+                                if let Some(contact) = click_contact.as_ref() {
+                                    send_remote_message(&mut identity, contact, &delivery_queue, &mut draft, &mut messages, &mut last_error, &autosave_password);
+                                }
                             },
                             "Encrypt & send"
                         }
@@ -458,6 +484,7 @@ async fn run_delivery_worker(
     mut status: Signal<MailboxConnectionStatus>,
     local_mailbox_token: Signal<Option<[u8; 32]>>,
     mut conversation: Signal<Result<MlsConversation, String>>,
+    mut identity: Signal<Result<Option<DeviceIdentity>, String>>,
     mut messages: Signal<Vec<DisplayMessage>>,
     mut last_error: Signal<Option<String>>,
     autosave_password: Signal<Zeroizing<Vec<u8>>>,
@@ -566,6 +593,16 @@ async fn run_delivery_worker(
                 }
             }
             if !autosave_password.read().is_empty() {
+                if let Err(error) = sync_remote_outbound_journal(
+                    &mut identity,
+                    &queue,
+                    autosave_password.read().as_slice(),
+                ) {
+                    update_connection_detail(
+                        &mut status,
+                        format!("Remote queue recovery failed; will retry: {error}"),
+                    );
+                }
                 match sync_outbound_journal(
                     &mut conversation,
                     &queue,
@@ -602,7 +639,14 @@ async fn run_delivery_worker(
                             let already_processed =
                                 conversation.read().as_ref().is_ok_and(|conversation| {
                                     conversation.has_inbound_receipt(&stored.receipt)
-                                });
+                                }) || identity
+                                    .read()
+                                    .as_ref()
+                                    .ok()
+                                    .and_then(Option::as_ref)
+                                    .is_some_and(|device| {
+                                        device.has_remote_inbound_receipt(&stored.receipt)
+                                    });
                             if already_processed {
                                 receipts.push(stored.receipt);
                                 continue;
@@ -614,17 +658,73 @@ async fn run_delivery_worker(
                                 ));
                                 break;
                             }
-                            let decrypted = match conversation.write().as_mut() {
-                                Ok(conversation) => conversation
-                                    .process_inbound_and_save(
-                                        &stored.envelope.ciphertext,
-                                        stored.receipt,
-                                        stored.expires_unix_ms,
-                                        state_path(),
-                                        autosave_password.read().as_slice(),
-                                    )
-                                    .map_err(|error| error.to_string()),
-                                Err(error) => Err(error.clone()),
+                            let decrypted = match decode_client_payload(&stored.envelope.ciphertext)
+                            {
+                                Ok(ClientPayload::InvitationAcceptance(acceptance)) => {
+                                    let mut state = identity.write();
+                                    let device = state
+                                        .as_mut()
+                                        .map_err(|error| error.clone())
+                                        .and_then(|device| {
+                                            device
+                                                .as_mut()
+                                                .ok_or_else(|| "Device is locked".to_owned())
+                                        });
+                                    match device {
+                                        Ok(device) => device
+                                            .process_invitation_acceptance(&acceptance)
+                                            .and_then(|contact| {
+                                                device.save_encrypted(
+                                                    identity_path(),
+                                                    autosave_password.read().as_slice(),
+                                                )?;
+                                                Ok(format!(
+                                                    "MLS session established with {}",
+                                                    contact.display_name
+                                                )
+                                                .into_bytes())
+                                            })
+                                            .map_err(|error| error.to_string()),
+                                        Err(error) => Err(error),
+                                    }
+                                }
+                                Ok(ClientPayload::MlsApplication {
+                                    sender_device,
+                                    ciphertext,
+                                }) => {
+                                    let mut state = identity.write();
+                                    match state.as_mut().map_err(|error| error.clone()).and_then(
+                                        |device| {
+                                            device
+                                                .as_mut()
+                                                .ok_or_else(|| "Device is locked".to_owned())
+                                        },
+                                    ) {
+                                        Ok(device) => device
+                                            .process_remote_inbound_and_save(
+                                                sender_device,
+                                                &ciphertext,
+                                                stored.receipt,
+                                                stored.expires_unix_ms,
+                                                identity_path(),
+                                                autosave_password.read().as_slice(),
+                                            )
+                                            .map_err(|error| error.to_string()),
+                                        Err(error) => Err(error),
+                                    }
+                                }
+                                Err(_) => match conversation.write().as_mut() {
+                                    Ok(conversation) => conversation
+                                        .process_inbound_and_save(
+                                            &stored.envelope.ciphertext,
+                                            stored.receipt,
+                                            stored.expires_unix_ms,
+                                            state_path(),
+                                            autosave_password.read().as_slice(),
+                                        )
+                                        .map_err(|error| error.to_string()),
+                                    Err(error) => Err(error.clone()),
+                                },
                             };
                             match decrypted {
                                 Ok(plaintext) => {
@@ -877,10 +977,65 @@ fn verify_contact_fingerprint(
     }
 }
 
-fn send_message(
-    conversation: &mut Signal<Result<MlsConversation, String>>,
+fn accept_contact_invitation(
+    identity: &mut Signal<Result<Option<DeviceIdentity>, String>>,
+    device_id: uuid::Uuid,
+    autosave_password: Signal<Zeroizing<Vec<u8>>>,
     delivery_queue: &Signal<Result<DeliveryQueue, String>>,
-    mailbox_token: Signal<Option<[u8; 32]>>,
+    status: &mut Signal<Option<String>>,
+) {
+    let result = (|| -> Result<(), String> {
+        let mut state = identity.write();
+        let device = state
+            .as_mut()
+            .map_err(|error| error.clone())?
+            .as_mut()
+            .ok_or_else(|| "Device is locked".to_owned())?;
+        let contact = device
+            .contacts()
+            .iter()
+            .find(|contact| contact.device_id == device_id)
+            .cloned()
+            .ok_or_else(|| "Contact does not exist".to_owned())?;
+        if !contact.verified {
+            return Err("Verify the contact fingerprint first".into());
+        }
+        let acceptance = device
+            .accept_invitation(device_id)
+            .map_err(|error| error.to_string())?;
+        let payload = encode_client_payload(&ClientPayload::InvitationAcceptance(acceptance))
+            .map_err(|error| error.to_string())?;
+        let pending = device
+            .journal_remote_payload_and_save(
+                payload,
+                contact.send_mailbox_token,
+                identity_path(),
+                autosave_password.read().as_slice(),
+            )
+            .map_err(|error| error.to_string())?;
+        let queue_state = delivery_queue.read();
+        let queue = queue_state.as_ref().map_err(|error| error.clone())?;
+        queue
+            .enqueue_idempotent(pending.id, pending.mailbox_token, &pending.ciphertext)
+            .map_err(|error| error.to_string())?;
+        device
+            .mark_remote_outbound_queued_and_save(
+                pending.id,
+                identity_path(),
+                autosave_password.read().as_slice(),
+            )
+            .map_err(|error| error.to_string())
+    })();
+    status.set(Some(match result {
+        Ok(()) => "MLS session created; signed Welcome queued for Tor delivery".into(),
+        Err(error) => format!("Could not accept invitation: {error}"),
+    }));
+}
+
+fn send_remote_message(
+    identity: &mut Signal<Result<Option<DeviceIdentity>, String>>,
+    contact: &ContactRecord,
+    delivery_queue: &Signal<Result<DeliveryQueue, String>>,
     draft: &mut Signal<String>,
     messages: &mut Signal<Vec<DisplayMessage>>,
     last_error: &mut Signal<Option<String>>,
@@ -890,73 +1045,49 @@ fn send_message(
     if plaintext.is_empty() {
         return;
     }
-    let result = match conversation.write().as_mut() {
-        Ok(conversation) => (|| {
-            let token = *mailbox_token.read();
-            let (ciphertext_size, decrypted, queued, warning) = match token.as_ref() {
-                Some(token) => {
-                    let queue_state = delivery_queue.read();
-                    let queue = queue_state
-                        .as_ref()
-                        .map_err(|error| format!("Delivery queue unavailable: {error}"))?;
-                    if autosave_password.read().is_empty() {
-                        return Err(
-                            "Save or unlock the vault before queueing an outbound message".into(),
-                        );
-                    }
-                    let (pending, decrypted) = conversation
-                        .create_outbound_and_save(
-                            plaintext.as_bytes(),
-                            *token,
-                            state_path(),
-                            autosave_password.read().as_slice(),
-                        )
-                        .map_err(|error| error.to_string())?;
-                    let ciphertext_size = pending.ciphertext.len();
-                    let warning = match queue.enqueue_idempotent(
-                        pending.id,
-                        pending.mailbox_token,
-                        &pending.ciphertext,
-                    ) {
-                        Ok(()) => conversation
-                            .mark_outbound_queued_and_save(
-                                pending.id,
-                                state_path(),
-                                autosave_password.read().as_slice(),
-                            )
-                            .err()
-                            .map(|error| format!("Queue handoff saved for retry: {error}")),
-                        Err(error) => Some(format!(
-                            "Message is safe in outbound journal; queue handoff will retry: {error}"
-                        )),
-                    };
-                    (ciphertext_size, decrypted, true, warning)
-                }
-                None => {
-                    let (ciphertext_size, decrypted) = conversation
-                        .round_trip_from_alice(plaintext.as_bytes())
-                        .map_err(|error| error.to_string())?;
-                    (ciphertext_size, decrypted, false, None)
-                }
-            };
-            Ok((ciphertext_size, decrypted, queued, warning))
-        })(),
-        Err(error) => Err(error.clone()),
-    };
+    let result = (|| -> Result<usize, String> {
+        let mut state = identity.write();
+        let device = state
+            .as_mut()
+            .map_err(|error| error.clone())?
+            .as_mut()
+            .ok_or_else(|| "Device is locked".to_owned())?;
+        let pending = device
+            .create_remote_outbound_and_save(
+                contact.device_id,
+                plaintext.as_bytes(),
+                contact.send_mailbox_token,
+                identity_path(),
+                autosave_password.read().as_slice(),
+            )
+            .map_err(|error| error.to_string())?;
+        let ciphertext_size = pending.ciphertext.len();
+        delivery_queue
+            .read()
+            .as_ref()
+            .map_err(|error| error.clone())?
+            .enqueue_idempotent(pending.id, pending.mailbox_token, &pending.ciphertext)
+            .map_err(|error| error.to_string())?;
+        device
+            .mark_remote_outbound_queued_and_save(
+                pending.id,
+                identity_path(),
+                autosave_password.read().as_slice(),
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(ciphertext_size)
+    })();
     match result {
-        Ok((ciphertext_size, decrypted, queued, warning)) => match String::from_utf8(decrypted) {
-            Ok(decrypted) => {
-                messages.write().push(DisplayMessage {
-                    plaintext: decrypted,
-                    ciphertext_size,
-                    queued,
-                    incoming: false,
-                });
-                draft.set(String::new());
-                last_error.set(warning);
-            }
-            Err(_) => last_error.set(Some("Peer returned invalid UTF-8 application data".into())),
-        },
+        Ok(ciphertext_size) => {
+            messages.write().push(DisplayMessage {
+                plaintext,
+                ciphertext_size,
+                queued: true,
+                incoming: false,
+            });
+            draft.set(String::new());
+            last_error.set(None);
+        }
         Err(error) => last_error.set(Some(error)),
     }
 }
@@ -976,6 +1107,31 @@ fn sync_outbound_journal(
             .map_err(|error| error.to_string())?;
         conversation
             .mark_outbound_queued_and_save(item.id, state_path(), password)
+            .map_err(|error| error.to_string())?;
+        recovered += 1;
+    }
+    Ok(recovered)
+}
+
+fn sync_remote_outbound_journal(
+    identity: &mut Signal<Result<Option<DeviceIdentity>, String>>,
+    queue: &DeliveryQueue,
+    password: &[u8],
+) -> Result<usize, String> {
+    let mut state = identity.write();
+    let device = state
+        .as_mut()
+        .map_err(|error| error.clone())?
+        .as_mut()
+        .ok_or_else(|| "Device is locked".to_owned())?;
+    let pending = device.remote_pending_outbound();
+    let mut recovered = 0;
+    for item in pending {
+        queue
+            .enqueue_idempotent(item.id, item.mailbox_token, &item.ciphertext)
+            .map_err(|error| error.to_string())?;
+        device
+            .mark_remote_outbound_queued_and_save(item.id, identity_path(), password)
             .map_err(|error| error.to_string())?;
         recovered += 1;
     }

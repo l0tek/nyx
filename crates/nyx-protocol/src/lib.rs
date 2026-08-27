@@ -78,6 +78,18 @@ pub enum ContentType {
     Control,
 }
 
+/// Client-to-client payload stored opaquely by the mailbox service.
+///
+/// Append variants only: Postcard encodes enum discriminants by position.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ClientPayload {
+    InvitationAcceptance(Vec<u8>),
+    MlsApplication {
+        sender_device: Uuid,
+        ciphertext: Vec<u8>,
+    },
+}
+
 #[derive(Debug, Error)]
 pub enum ProtocolError {
     #[error("serialization failed")]
@@ -107,6 +119,14 @@ pub fn encode_response(value: &MailboxResponse) -> Result<Vec<u8>, ProtocolError
 }
 
 pub fn decode_response(bytes: &[u8]) -> Result<MailboxResponse, ProtocolError> {
+    decode_frame(bytes)
+}
+
+pub fn encode_client_payload(value: &ClientPayload) -> Result<Vec<u8>, ProtocolError> {
+    encode_frame(value)
+}
+
+pub fn decode_client_payload(bytes: &[u8]) -> Result<ClientPayload, ProtocolError> {
     decode_frame(bytes)
 }
 
@@ -200,5 +220,17 @@ mod tests {
         assert_eq!(first, envelope_receipt(&envelope).unwrap());
         envelope.ciphertext.push(4);
         assert_ne!(first, envelope_receipt(&envelope).unwrap());
+    }
+
+    #[test]
+    fn client_payload_round_trip() {
+        let payload = ClientPayload::MlsApplication {
+            sender_device: Uuid::new_v4(),
+            ciphertext: vec![1, 2, 3],
+        };
+        assert!(matches!(
+            decode_client_payload(&encode_client_payload(&payload).unwrap()).unwrap(),
+            ClientPayload::MlsApplication { ciphertext, .. } if ciphertext == vec![1, 2, 3]
+        ));
     }
 }
