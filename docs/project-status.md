@@ -28,7 +28,10 @@ not suitable for sensitive or production communication.
 
 ### Other components
 
-- The Dioxus desktop scaffold builds and runs.
+- The Dioxus desktop app builds and exposes an interactive local MLS chat demo.
+  Submitted text is encrypted into a real OpenMLS PrivateMessage, processed by
+  the invited peer group, and shown only after successful decryption. The UI
+  reports ciphertext size and initialization/runtime errors.
 - `nyx-tor` now bootstraps an Arti client, accepts only syntactically valid v3
   `.onion` endpoints, and implements bounded deposit/fetch/ack requests with a
   60-second timeout. It exposes no Clearnet connection method.
@@ -40,18 +43,23 @@ not suitable for sensitive or production communication.
 - `nyx-crypto` generates an Ed25519 basic device credential and an RFC 9420
   KeyPackage using OpenMLS with the X25519/AES-128-GCM/SHA-256 ciphersuite. The
   provider is currently memory-backed and explicitly not production-persistent.
+- `nyx-crypto` creates a two-member group, adds the peer KeyPackage, serializes
+  and processes the Welcome, verifies matching epoch authenticators, exchanges
+  encrypted application messages, and rejects replayed messages.
 - The SQLite client-store boundary remains a scaffold.
-- The workspace currently has nine crypto/transport/mailbox/protocol unit tests
-  covering MLS device material validation, request serialization,
+- The workspace currently has eleven crypto/transport/mailbox/protocol unit tests
+  covering MLS group/Welcome/message processing, replay rejection, device
+  material validation, request serialization,
   oversized-frame rejection, receipt binding, mailbox lifecycle, cross-mailbox
   ACK isolation, Onion endpoint validation, and invalid input rejection.
 
 ## Not implemented
 
-- The desktop UI is not connected to the implemented `nyx-tor` transport.
-- OpenMLS group creation/joining, encryption, decryption, commits, and encrypted
-  key persistence are not implemented. Device credentials and KeyPackages are
-  currently volatile foundations only.
+- The desktop UI exercises MLS locally but is not connected to the implemented
+  `nyx-tor` transport or mailbox server.
+- General group lifecycle operations, remote commit handling, removals, updates,
+  and encrypted key/group-state persistence are not implemented. The current
+  two-member MLS conversation is volatile and recreated on app start.
 - Device identity generation, contact invitations, out-of-band verification,
   and multi-device behavior are not implemented.
 - The local client store is not encrypted and contains only a generic `kv`
@@ -97,7 +105,7 @@ publication or reachability on the public Tor network.
 
 ## Next milestone
 
-The next useful milestone is OpenMLS identity, group, and persistence
-integration with deterministic local tests. That must precede wiring real
-message content into the transport or desktop UI. The manual live-Tor smoke test
-should later become an isolated, opt-in CI job.
+The next useful milestone is encrypted persistence for device keys and OpenMLS
+group state, followed by a queue that moves serialized MLS messages between the
+desktop app and `nyx-tor`. The manual live-Tor smoke test should later become an
+isolated, opt-in CI job.
