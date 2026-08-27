@@ -4860,6 +4860,8 @@ dependencies = [
  "dioxus",
  "nyx-crypto",
  "nyx-store",
+ "nyx-tor",
+ "tokio",
  "zeroize",
 ]
 

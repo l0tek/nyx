@@ -42,7 +42,8 @@ not suitable for sensitive or production communication.
 - Envelope and encrypted-message serialization exists.
 - `nyx-crypto` generates an Ed25519 basic device credential and an RFC 9420
   KeyPackage using OpenMLS with the X25519/AES-128-GCM/SHA-256 ciphersuite. The
-  provider is currently memory-backed and explicitly not production-persistent.
+  active provider is memory-backed; its complete state can be exported into the
+  authenticated encrypted snapshot described below.
 - `nyx-crypto` creates a two-member group, adds the peer KeyPackage, serializes
   and processes the Welcome, verifies matching epoch authenticators, exchanges
   encrypted application messages, and rejects replayed messages.
@@ -63,11 +64,17 @@ not suitable for sensitive or production communication.
   `NYX_DELIVERY_QUEUE_PATH`.
 - `nyx-tor` can flush queued envelopes in order, record an attempt before each
   request, and mark delivery only after the Onion mailbox confirms deposit.
+- The desktop owns an asynchronous worker that validates `NYX_MAILBOX_ONION`,
+  bootstraps Tor without a Clearnet fallback, flushes every ten seconds, keeps
+  failures queued, and reports bootstrap/delivery/retry state in the sidebar.
+- With `NYX_LOCAL_MAILBOX_TOKEN_HEX`, the worker also fetches inbound envelopes,
+  processes Bob-to-Alice OpenMLS application messages, displays valid UTF-8
+  text, and acknowledges only MLS messages that were processed successfully.
 - The generic SQLite client-store boundary remains a separate scaffold.
 - The desktop sidebar provides explicit Save and Unlock actions for this MLS
   state. The vault password is zeroized after each operation. The location is
   `nyx-desktop-state.nyx` or `NYX_DESKTOP_STATE_PATH` when configured.
-- The workspace currently has seventeen store/crypto/transport/mailbox/protocol unit tests
+- The workspace currently has eighteen store/crypto/transport/mailbox/protocol unit tests
   covering MLS group/Welcome/message processing, replay rejection, device
   material validation, request serialization,
   oversized-frame rejection, receipt binding, mailbox lifecycle, cross-mailbox
@@ -75,11 +82,12 @@ not suitable for sensitive or production communication.
 
 ## Not implemented
 
-- The desktop does not yet bootstrap and run the asynchronous Tor queue worker;
-  invoking the implemented queue flush still requires application wiring.
-- General group lifecycle operations, remote commit handling, removals, updates,
-  and encrypted key/group-state persistence are not implemented. The current
-  two-member MLS conversation is volatile and recreated on app start.
+- Inbound receipt state is not yet journaled atomically with the MLS ratchet. A
+  crash or failed ACK after successful decryption can cause a replayed envelope
+  to remain on the mailbox until explicit recovery logic is implemented.
+- General group lifecycle operations, remote commit handling, removals, and
+  updates are not implemented. Without an explicit Unlock action, the current
+  two-member demo conversation is recreated on app start.
 - Device identity generation, contact invitations, out-of-band verification,
   and multi-device behavior are not implemented.
 - Persistence is manual; there is no automatic save, locking timer, password
@@ -88,8 +96,9 @@ not suitable for sensitive or production communication.
 - The generic client SQLite `kv` store remains unencrypted and must not hold
   secrets.
 - Attachment transfer, padding buckets, batching, cover traffic, token
-  rotation, retries, encrypted ACK payloads, and optional direct peer Onion
-  Services are not implemented.
+  rotation, bounded retry backoff, encrypted ACK payloads, and optional direct
+  peer Onion Services are not implemented. The current worker retries at a
+  fixed ten-second interval.
 - Onion client authorization, operator authentication, quotas across mailbox
   tokens, global disk quotas, and production-grade abuse controls are not
   implemented.
@@ -124,15 +133,34 @@ not suitable for sensitive or production communication.
 ```bash
 cargo fmt --all -- --check
 cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Both commands pass. A successful compile and unit-test run does not verify
+All commands pass. A successful compile and unit-test run does not verify
 publication or reachability on the public Tor network.
 
 ## Next milestone
 
-The next useful milestone is a desktop-owned asynchronous worker that bootstraps
-Tor, flushes the new durable queue, reports retry state in the UI, and fetches
-and acknowledges inbound envelopes. Automatic safe-save and lock behavior
+The next useful milestone is an inbound receipt journal coordinated with
+automatic encrypted MLS safe-save, so a crash between ratchet advancement and
+mailbox acknowledgement can recover deterministically. Lock timeout behavior
 should follow. The manual live-Tor smoke test should later become an isolated,
 opt-in CI job.
+
+## Resume notes
+
+Start with the inbound receipt journal and automatic encrypted MLS safe-save.
+The desktop transport configuration is:
+
+```bash
+export NYX_MAILBOX_ONION="<v3-address>.onion"
+export NYX_MAILBOX_PORT="443"
+export NYX_RECIPIENT_MAILBOX_TOKEN_HEX="<64 hexadecimal characters>"
+export NYX_LOCAL_MAILBOX_TOKEN_HEX="<64 hexadecimal characters>"
+cd apps/desktop
+dx serve --desktop
+```
+
+Do not test with sensitive messages. A live public-Tor integration run still
+requires an explicitly started mailbox server and has not been completed for
+this revision.

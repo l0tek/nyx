@@ -9,4 +9,6 @@ license.workspace = true
 dioxus.workspace = true
 nyx-crypto = { path = "../nyx-crypto" }
 nyx-store = { path = "../nyx-store" }
+nyx-tor = { path = "../nyx-tor" }
+tokio.workspace = true
 zeroize.workspace = true

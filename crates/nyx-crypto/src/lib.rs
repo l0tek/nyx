@@ -207,6 +207,33 @@ impl MlsConversation {
         }
     }
 
+    pub fn encrypt_from_bob(&mut self, plaintext: &[u8]) -> Result<Vec<u8>> {
+        if plaintext.is_empty() {
+            bail!("MLS application message must not be empty");
+        }
+        self.bob_group
+            .create_message(self.bob.provider(), self.bob.signer(), plaintext)
+            .map_err(|error| anyhow::anyhow!("encrypt peer MLS application message: {error:?}"))?
+            .to_bytes()
+            .map_err(|error| anyhow::anyhow!("serialize peer MLS application message: {error:?}"))
+    }
+
+    pub fn decrypt_for_alice(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>> {
+        let message = MlsMessageIn::tls_deserialize_exact(ciphertext)
+            .map_err(|error| anyhow::anyhow!("deserialize peer MLS message: {error:?}"))?;
+        let protocol_message = message
+            .try_into_protocol_message()
+            .map_err(|error| anyhow::anyhow!("expected a peer MLS protocol message: {error:?}"))?;
+        let processed = self
+            .alice_group
+            .process_message(self.alice.provider(), protocol_message)
+            .map_err(|error| anyhow::anyhow!("decrypt peer MLS application message: {error:?}"))?;
+        match processed.into_content() {
+            ProcessedMessageContent::ApplicationMessage(message) => Ok(message.into_bytes()),
+            _ => bail!("received peer MLS message is not application data"),
+        }
+    }
+
     pub fn round_trip_from_alice(&mut self, plaintext: &[u8]) -> Result<(usize, Vec<u8>)> {
         let ciphertext = self.encrypt_from_alice(plaintext)?;
         let ciphertext_size = ciphertext.len();
@@ -360,6 +387,18 @@ mod tests {
             b"one time"
         );
         assert!(conversation.decrypt_for_bob(&ciphertext).is_err());
+    }
+
+    #[test]
+    fn exchanges_application_message_from_peer_to_local_device() {
+        let mut conversation =
+            MlsConversation::new_1to1(b"alice".to_vec(), b"bob".to_vec()).unwrap();
+        let ciphertext = conversation.encrypt_from_bob(b"reply from peer").unwrap();
+        assert_eq!(
+            conversation.decrypt_for_alice(&ciphertext).unwrap(),
+            b"reply from peer"
+        );
+        assert!(conversation.decrypt_for_alice(&ciphertext).is_err());
     }
 
     #[test]

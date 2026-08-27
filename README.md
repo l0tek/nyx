@@ -83,9 +83,11 @@ state through the Argon2id/XChaCha20-Poly1305 encrypted store. It writes
 `nyx-desktop-state.nyx` by default; use `NYX_DESKTOP_STATE_PATH` to override the
 location. When `NYX_RECIPIENT_MAILBOX_TOKEN_HEX` contains a 32-byte token as 64
 hexadecimal characters, sent MLS ciphertext is durably queued in
-`nyx-delivery.sqlite3`; override it with `NYX_DELIVERY_QUEUE_PATH`. `nyx-tor`
-can flush this queue to a validated v3 Onion endpoint, but the desktop does not
-yet run that asynchronous worker automatically. Saving is still manual. Do not replace the crypto boundary with
+`nyx-delivery.sqlite3`; override it with `NYX_DELIVERY_QUEUE_PATH`. The desktop
+flushes this queue automatically when `NYX_MAILBOX_ONION` names a validated v3
+Onion endpoint (`NYX_MAILBOX_PORT` defaults to `443`). Configure
+`NYX_LOCAL_MAILBOX_TOKEN_HEX` to poll, MLS-decrypt, and acknowledge inbound
+messages. Saving is still manual. Do not replace the crypto boundary with
 ad-hoc cryptography or use the demo for sensitive messaging.
 
 ## Security rule

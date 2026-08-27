@@ -1,7 +1,8 @@
 use dioxus::prelude::*;
 use nyx_crypto::MlsConversation;
 use nyx_store::DeliveryQueue;
-use std::path::PathBuf;
+use nyx_tor::{OnionEndpoint, TorTransport};
+use std::{path::PathBuf, time::Duration};
 use zeroize::Zeroize;
 
 const CSS: &str = r#"
@@ -27,6 +28,7 @@ button, input { font: inherit; }
 .messages { padding: 24px; overflow: auto; display: flex; flex-direction: column; gap: 14px; }
 .empty { margin: auto; max-width: 490px; color: #8b98a5; text-align: center; line-height: 1.55; }
 .bubble { align-self: flex-end; max-width: 72%; background: #17324a; border: 1px solid #28557a; padding: 13px 15px; border-radius: 14px 14px 3px 14px; }
+.bubble.incoming { align-self: flex-start; background: #18231d; border-color: #34513e; border-radius: 14px 14px 14px 3px; }
 .bubble p { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 .meta { margin-top: 8px; color: #91abc1; font-size: 11px; }
 .error { color: #ffb4ab; background: #351614; border: 1px solid #71322e; padding: 12px; border-radius: 10px; }
@@ -42,6 +44,8 @@ button, input { font: inherit; }
 .vault button { color: #cdd9e3; background: #1a2530; border: 1px solid #33404d; border-radius: 8px; padding: 8px; cursor: pointer; }
 .vault button:disabled { opacity: .4; cursor: default; }
 .vault-result { color: #91abc1; font-size: 11px; margin-top: 9px; overflow-wrap: anywhere; }
+.transport { margin-top: 18px; padding: 12px; border: 1px solid #2a3540; border-radius: 10px; background: #0c1218; }
+.transport-state { margin-top: 6px; color: #91abc1; font-size: 11px; line-height: 1.4; overflow-wrap: anywhere; }
 @media (max-width: 760px) { .app { grid-template-columns: 1fr; } .sidebar { display: none; } .main { padding: 12px; } .panel { min-height: calc(100vh - 24px); } }
 "#;
 
@@ -50,6 +54,7 @@ struct DisplayMessage {
     plaintext: String,
     ciphertext_size: usize,
     queued: bool,
+    incoming: bool,
 }
 
 #[component]
@@ -66,7 +71,19 @@ pub fn App() -> Element {
     let delivery_queue = use_signal(|| {
         DeliveryQueue::open(delivery_queue_path()).map_err(|error| error.to_string())
     });
-    let mailbox_token = mailbox_token_from_environment().ok();
+    let mailbox_token = token_from_environment("NYX_RECIPIENT_MAILBOX_TOKEN_HEX").ok();
+    let local_mailbox_token = token_from_environment("NYX_LOCAL_MAILBOX_TOKEN_HEX").ok();
+    let transport_status =
+        use_signal(|| "Tor worker disabled: NYX_MAILBOX_ONION is not set".to_owned());
+    use_future(move || {
+        run_delivery_worker(
+            transport_status,
+            local_mailbox_token,
+            conversation,
+            messages,
+            last_error,
+        )
+    });
 
     let mls_ready = conversation.read().is_ok();
     let member_count = conversation
@@ -92,6 +109,10 @@ pub fn App() -> Element {
                 }
                 p { class: "warning",
                     if mailbox_token.is_some() { "MLS ciphertext is persisted to the Tor delivery queue." } else { "Set NYX_RECIPIENT_MAILBOX_TOKEN_HEX to enable durable delivery queueing." }
+                }
+                div { class: "transport",
+                    div { class: "eyebrow", "Tor delivery" }
+                    div { class: "transport-state", "{transport_status}" }
                 }
                 div { class: "vault",
                     div { class: "eyebrow", "Encrypted MLS state" }
@@ -135,7 +156,7 @@ pub fn App() -> Element {
                             }
                         }
                         for (index, message) in messages.read().iter().enumerate() {
-                            div { class: "bubble", key: "{index}",
+                            div { class: if message.incoming { "bubble incoming" } else { "bubble" }, key: "{index}",
                                 p { "{message.plaintext}" }
                                 div { class: "meta",
                                     "MLS ciphertext: {message.ciphertext_size} bytes · "
@@ -184,9 +205,8 @@ fn delivery_queue_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("nyx-delivery.sqlite3"))
 }
 
-fn mailbox_token_from_environment() -> Result<[u8; 32], String> {
-    let encoded = std::env::var("NYX_RECIPIENT_MAILBOX_TOKEN_HEX")
-        .map_err(|_| "recipient mailbox token is not configured".to_owned())?;
+fn token_from_environment(name: &str) -> Result<[u8; 32], String> {
+    let encoded = std::env::var(name).map_err(|_| format!("{name} is not configured"))?;
     if encoded.len() != 64 {
         return Err("recipient mailbox token must contain 64 hexadecimal characters".into());
     }
@@ -196,6 +216,113 @@ fn mailbox_token_from_environment() -> Result<[u8; 32], String> {
             .map_err(|_| "recipient mailbox token contains invalid hexadecimal data")?;
     }
     Ok(token)
+}
+
+async fn run_delivery_worker(
+    mut status: Signal<String>,
+    local_mailbox_token: Option<[u8; 32]>,
+    mut conversation: Signal<Result<MlsConversation, String>>,
+    mut messages: Signal<Vec<DisplayMessage>>,
+    mut last_error: Signal<Option<String>>,
+) {
+    let host = match std::env::var("NYX_MAILBOX_ONION") {
+        Ok(host) => host,
+        Err(_) => return,
+    };
+    let port = match std::env::var("NYX_MAILBOX_PORT") {
+        Ok(value) => match value.parse::<u16>() {
+            Ok(port) => port,
+            Err(_) => {
+                status.set("Tor worker disabled: NYX_MAILBOX_PORT is invalid".into());
+                return;
+            }
+        },
+        Err(_) => 443,
+    };
+    let endpoint = match OnionEndpoint::new(host, port) {
+        Ok(endpoint) => endpoint,
+        Err(error) => {
+            status.set(format!("Tor worker disabled: {error}"));
+            return;
+        }
+    };
+    let queue = match DeliveryQueue::open(delivery_queue_path()) {
+        Ok(queue) => queue,
+        Err(error) => {
+            status.set(format!("Delivery queue unavailable: {error}"));
+            return;
+        }
+    };
+
+    loop {
+        status.set("Bootstrapping Tor…".into());
+        let transport = match TorTransport::bootstrap().await {
+            Ok(transport) => transport,
+            Err(error) => {
+                status.set(format!("Tor bootstrap failed; retrying: {error}"));
+                tokio::time::sleep(Duration::from_secs(15)).await;
+                continue;
+            }
+        };
+        status.set("Tor ready; watching delivery queue".into());
+
+        loop {
+            match transport.flush_delivery_queue(&endpoint, &queue, 32).await {
+                Ok(report) if report.delivered > 0 => status.set(format!(
+                    "Tor ready; delivered {} queued message(s)",
+                    report.delivered
+                )),
+                Ok(_) => status.set("Tor ready; delivery queue is empty".into()),
+                Err(error) => status.set(format!("Delivery failed; queued for retry: {error}")),
+            }
+
+            if let Some(token) = local_mailbox_token {
+                match transport.fetch(&endpoint, token, 32).await {
+                    Ok(envelopes) => {
+                        let mut receipts = Vec::new();
+                        for stored in envelopes {
+                            let decrypted = match conversation.write().as_mut() {
+                                Ok(conversation) => conversation
+                                    .decrypt_for_alice(&stored.envelope.ciphertext)
+                                    .map_err(|error| error.to_string()),
+                                Err(error) => Err(error.clone()),
+                            };
+                            match decrypted {
+                                Ok(plaintext) => {
+                                    receipts.push(stored.receipt);
+                                    match String::from_utf8(plaintext) {
+                                        Ok(plaintext) => messages.write().push(DisplayMessage {
+                                            plaintext,
+                                            ciphertext_size: stored.envelope.ciphertext.len(),
+                                            queued: false,
+                                            incoming: true,
+                                        }),
+                                        Err(_) => last_error.set(Some(
+                                            "Received MLS application data is not UTF-8".into(),
+                                        )),
+                                    }
+                                }
+                                Err(error) => last_error
+                                    .set(Some(format!("Inbound MLS message rejected: {error}"))),
+                            }
+                        }
+                        if !receipts.is_empty() {
+                            match transport.acknowledge(&endpoint, token, receipts).await {
+                                Ok(deleted) => status.set(format!(
+                                    "Tor ready; received and acknowledged {deleted} message(s)"
+                                )),
+                                Err(error) => status.set(format!(
+                                    "Messages decrypted; mailbox acknowledgement failed: {error}"
+                                )),
+                            }
+                        }
+                    }
+                    Err(error) => status.set(format!("Mailbox fetch failed; retrying: {error}")),
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        }
+    }
 }
 
 fn save_session(
@@ -279,6 +406,7 @@ fn send_message(
                     plaintext: decrypted,
                     ciphertext_size,
                     queued,
+                    incoming: false,
                 });
                 draft.set(String::new());
                 last_error.set(None);
