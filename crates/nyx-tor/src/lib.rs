@@ -4,14 +4,14 @@
 //! direct TCP/Clearnet fallback path in this crate.
 
 use anyhow::{Context, Result, bail};
-use arti_client::{TorClient, TorClientConfig};
+use arti_client::{TorClient, TorClientConfig, config::TorClientConfigBuilder};
 use futures::{AsyncReadExt, AsyncWriteExt};
 use nyx_protocol::{
     Envelope, MAX_FRAME_SIZE, MailboxRequest, MailboxResponse, StoredEnvelope, decode_response,
     encode_request,
 };
 use nyx_store::DeliveryQueue;
-use std::{sync::Arc, time::Duration};
+use std::{path::Path, sync::Arc, time::Duration};
 use tor_hsservice::HsId;
 use tor_rtcompat::PreferredRuntime;
 
@@ -48,7 +48,22 @@ pub struct DeliveryReport {
 
 impl TorTransport {
     pub async fn bootstrap() -> Result<Self> {
-        let client = TorClient::create_bootstrapped(TorClientConfig::default())
+        Self::bootstrap_with_config(TorClientConfig::default()).await
+    }
+
+    pub async fn bootstrap_in(storage_root: impl AsRef<Path>) -> Result<Self> {
+        let storage_root = storage_root.as_ref();
+        let config = TorClientConfigBuilder::from_directories(
+            storage_root.join("state"),
+            storage_root.join("cache"),
+        )
+        .build()
+        .context("configure private Tor storage")?;
+        Self::bootstrap_with_config(config).await
+    }
+
+    async fn bootstrap_with_config(config: TorClientConfig) -> Result<Self> {
+        let client = TorClient::create_bootstrapped(config)
             .await
             .context("bootstrap Tor")?;
         Ok(Self { client })

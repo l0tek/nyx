@@ -463,6 +463,16 @@ pub fn App() -> Element {
                         p { class: "subtle", "Erzeuge eine signierte Einladung und teile sie über einen verifizierten externen Kanal." }
                         div { class: "field", label { "Signierte Einladung" } textarea { readonly: true, value: "{invitation_output}", placeholder: "Einladung erzeugen" } }
                         button { class: "primary", onclick: move |_| create_contact_invitation(&mut identity, autosave_password, &mut invitation_output, &mut contact_status, recipient_mailbox_token, local_mailbox_token), "Export erzeugen" }
+                        if !invitation_output.read().is_empty() {
+                            {
+                                let svg = qr_svg(invitation_output.read().as_str())
+                                    .unwrap_or_else(|error| format!("<p style='color:#900'>QR error: {error}</p>"));
+                                rsx! {
+                                    p { class: "subtle", "Diese signierte Kontakteinladung kann direkt von der anderen Nyx-App gescannt werden." }
+                                    div { style: "background: white; padding: 12px; width: min(420px, 100%); border: 2px solid #8dd39e", dangerous_inner_html: svg }
+                                }
+                            }
+                        }
                         if let Some(status) = contact_status.read().as_ref() { div { class: "tool-status", "{status}" } }
                     }
                 } else if *app_view.read() == AppView::ContactImport {
@@ -471,6 +481,10 @@ pub fn App() -> Element {
                         h2 { "Kontakt importieren" }
                         p { class: "subtle", "Füge hier eine signierte Nyx-Einladung ein." }
                         div { class: "field", label { "Signierte Einladung" } textarea { value: "{invitation_input}", placeholder: "Einladung einfügen", oninput: move |event| invitation_input.set(event.value()) } }
+                        if cfg!(target_os = "android") {
+                            video { id: "nyx-contact-qr-camera", autoplay: true, playsinline: true, style: "display:none; width:100%; margin-top:12px; border-radius:10px" }
+                            button { class: "primary", onclick: move |_| { spawn(scan_contact_qr(invitation_input, contact_status)); }, "QR-Code mit Kamera scannen" }
+                        }
                         button { class: "primary", disabled: invitation_input.read().trim().is_empty(), onclick: move |_| import_contact_invitation(&mut identity, autosave_password, &mut invitation_input, &mut contact_status, recipient_mailbox_token, local_mailbox_token, &mut selected_contact), "Prüfen und importieren" }
                         if let Some(status) = contact_status.read().as_ref() { div { class: "tool-status", "{status}" } }
                     }
@@ -708,13 +722,13 @@ async fn run_delivery_worker(
             Some(endpoint.host.clone()),
             false,
         );
-        let transport = match TorTransport::bootstrap().await {
+        let transport = match TorTransport::bootstrap_in(app_data_path("arti-client")).await {
             Ok(transport) => transport,
             Err(error) => {
                 update_connection_status(
                     &mut status,
                     ConnectionPhase::Degraded,
-                    format!("Tor bootstrap failed; retrying: {error}"),
+                    format!("Tor bootstrap failed; retrying: {error:#}"),
                     Some(endpoint.host.clone()),
                     false,
                 );
@@ -1175,6 +1189,17 @@ fn change_mailbox(
     }
 }
 
+fn qr_svg(payload: &str) -> Result<String, String> {
+    let code = qrcode::QrCode::with_error_correction_level(payload.as_bytes(), qrcode::EcLevel::L)
+        .map_err(|error| error.to_string())?;
+    Ok(code
+        .render::<qrcode::render::svg::Color>()
+        .min_dimensions(360, 360)
+        .dark_color(qrcode::render::svg::Color("#000000"))
+        .light_color(qrcode::render::svg::Color("#ffffff"))
+        .build())
+}
+
 fn create_contact_invitation(
     identity: &mut Signal<Result<Option<DeviceIdentity>, String>>,
     autosave_password: Signal<Zeroizing<Vec<u8>>>,
@@ -1214,6 +1239,59 @@ fn create_contact_invitation(
             ));
         }
         Err(error) => status.set(Some(format!("Invitation failed: {error}"))),
+    }
+}
+
+async fn scan_contact_qr(mut invitation_input: Signal<String>, mut status: Signal<Option<String>>) {
+    status.set(Some("Kamera wird geöffnet …".into()));
+    let result = dioxus::document::eval(
+        r#"
+        return await (async () => {
+            const video = document.getElementById('nyx-contact-qr-camera');
+            if (!video) throw new Error('camera preview is unavailable');
+            if (!navigator.mediaDevices?.getUserMedia) {
+                throw new Error('camera access is not supported by this Android WebView');
+            }
+            if (!('BarcodeDetector' in window)) {
+                throw new Error('QR recognition is not supported by this Android WebView');
+            }
+            const formats = await BarcodeDetector.getSupportedFormats();
+            if (!formats.includes('qr_code')) throw new Error('QR recognition is unavailable');
+            const stream = await navigator.mediaDevices.getUserMedia({
+                video: { facingMode: { ideal: 'environment' } },
+                audio: false
+            });
+            video.srcObject = stream;
+            video.style.display = 'block';
+            await video.play();
+            const detector = new BarcodeDetector({ formats: ['qr_code'] });
+            try {
+                const deadline = Date.now() + 45000;
+                while (Date.now() < deadline) {
+                    const codes = await detector.detect(video);
+                    const invitation = codes.find(code => code.rawValue)?.rawValue;
+                    if (invitation) return invitation;
+                    await new Promise(resolve => setTimeout(resolve, 180));
+                }
+                throw new Error('no QR code recognized within 45 seconds');
+            } finally {
+                stream.getTracks().forEach(track => track.stop());
+                video.srcObject = null;
+                video.style.display = 'none';
+            }
+        })();
+        "#,
+    )
+    .join::<String>()
+    .await;
+    match result {
+        Ok(invitation) => {
+            invitation_input.set(invitation);
+            status.set(Some(
+                "QR-Code erkannt; Einladung kann jetzt geprüft und importiert werden".into(),
+            ));
+        }
+        Err(error) => status.set(Some(format!("QR-Scan fehlgeschlagen: {error}"))),
     }
 }
 

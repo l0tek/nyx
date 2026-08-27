@@ -1,5 +1,6 @@
 /target
 /dist
+arti-client/
 .DS_Store
 *.db
 *.db-shm
