@@ -118,6 +118,9 @@ impl TorTransport {
             MailboxResponse::Ready {
                 version: nyx_protocol::PROTOCOL_VERSION,
             } => Ok(()),
+            MailboxResponse::Error(nyx_protocol::MailboxErrorCode::MalformedRequest) => {
+                bail!("mailbox server does not support health checks; restart the updated server")
+            }
             MailboxResponse::Error(code) => bail!("mailbox health check failed: {code:?}"),
             _ => bail!("mailbox returned an unexpected health response"),
         }

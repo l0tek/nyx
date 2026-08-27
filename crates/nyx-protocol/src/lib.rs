@@ -45,8 +45,9 @@ pub enum MailboxResponse {
     Deposited { receipt: [u8; 32] },
     Messages(Vec<StoredEnvelope>),
     Acknowledged { deleted: u16 },
-    Ready { version: u16 },
     Error(MailboxErrorCode),
+    // Append new variants to preserve Postcard enum discriminants.
+    Ready { version: u16 },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -134,6 +135,15 @@ fn decode_frame<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Result<T, ProtocolEr
 mod tests {
     use super::*;
 
+    #[allow(dead_code)]
+    #[derive(Serialize)]
+    enum VersionOneMailboxResponse {
+        Deposited { receipt: [u8; 32] },
+        Messages(Vec<StoredEnvelope>),
+        Acknowledged { deleted: u16 },
+        Error(MailboxErrorCode),
+    }
+
     #[test]
     fn mailbox_request_round_trip() {
         let request = MailboxRequest::Fetch {
@@ -155,6 +165,18 @@ mod tests {
             MailboxRequest::Health {
                 version: PROTOCOL_VERSION
             }
+        ));
+    }
+
+    #[test]
+    fn decodes_error_from_server_without_health_support() {
+        let encoded = postcard::to_allocvec(&VersionOneMailboxResponse::Error(
+            MailboxErrorCode::MalformedRequest,
+        ))
+        .unwrap();
+        assert!(matches!(
+            decode_response(&encoded).unwrap(),
+            MailboxResponse::Error(MailboxErrorCode::MalformedRequest)
         ));
     }
 

@@ -97,12 +97,13 @@ not suitable for sensitive or production communication.
   state. The password input is zeroized after each operation; a zeroizing
   in-memory copy remains available while inbound safe-save is active. The location is
   `nyx-desktop-state.nyx` or `NYX_DESKTOP_STATE_PATH` when configured.
-- The workspace currently has twenty-eight store/crypto/transport/mailbox/protocol/UI unit tests
+- The workspace currently has twenty-nine store/crypto/transport/mailbox/protocol/UI unit tests
   covering MLS group/Welcome/message processing, replay rejection, device
   material validation, request serialization,
   oversized-frame rejection, receipt binding, mailbox lifecycle, cross-mailbox
   ACK isolation, Onion endpoint validation, snapshot v1/v2 migration, idempotent
-  queue handoff, inbound/outbound safe-save rollback, and invalid input rejection.
+  queue handoff, inbound/outbound safe-save rollback, legacy response-discriminant
+  compatibility, and invalid input rejection.
 
 ## Not implemented
 
