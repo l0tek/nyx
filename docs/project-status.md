@@ -29,16 +29,24 @@ not suitable for sensitive or production communication.
 
 ### Other components
 
-- The Dioxus desktop app now starts with local registration or password login.
+- The shared Dioxus desktop/Android app now starts with a compact status view
+  and provides navigation through the native Dioxus menu, including back and
+  forward controls. Local registration and password login remain available.
   This is an encrypted on-device profile, not a central account: no e-mail,
   telephone number, directory username, or authentication server is involved.
 - A persistent device identity contains a separate Ed25519 invitation-signing
   key, stable device UUID, OpenMLS signing material/provider state, a validated
   RFC 9420 KeyPackage, contacts, and outstanding directional capabilities. It is
   stored with the authenticated encrypted blob format.
-- The desktop exposes the device fingerprint, signed invitation generation,
+- The app exposes the device fingerprint, signed contact invitation generation,
   invitation import, contact selection, explicit out-of-band fingerprint
-  verification, account locking, and the mailbox connection state in a revised UI.
+  verification, account locking, and mailbox connection state in a revised UI.
+  Contact invitations can be exported as a visible QR code on desktop and
+  Android. Android can scan the same signed contact QR invitation with its
+  camera; this is contact exchange only and does not export the local identity.
+- Configuration is available from the Dioxus menu. The bundled default mailbox
+  Onion address is shown there and can be edited; additional mailbox entries can
+  be added, selected, changed, and persisted locally on desktop and Android.
 - Contact invitations are URL-safe Base64/Postcard objects signed over all
   fields. Import verifies the Ed25519 signature, timestamps, v3 Onion syntax,
   MLS KeyPackage signature/lifetime/ciphersuite, duplicate device IDs, and size
@@ -99,9 +107,11 @@ not suitable for sensitive or production communication.
   replay an MLS PrivateMessage.
 - `nyx-tor` can flush queued envelopes in order, record an attempt before each
   request, and mark delivery only after the Onion mailbox confirms deposit.
-- The desktop owns an asynchronous worker that validates `NYX_MAILBOX_ONION`,
+- The client owns an asynchronous worker that validates the selected mailbox,
   bootstraps Tor without a Clearnet fallback, flushes every ten seconds, keeps
-  failures queued, and reports bootstrap/delivery/retry state in the sidebar.
+  failures queued, and reports bootstrap/delivery/retry state. Arti client state
+  and cache are placed below the application data directory so Android does not
+  depend on an unavailable process working directory during bootstrap.
 - The sidebar exposes structured connection state for Tor bootstrap and Onion
   mailbox reachability, the configured endpoint, health-check latency, delivery
   detail, and time since the last successful mailbox check. A failed health check
@@ -126,8 +136,8 @@ not suitable for sensitive or production communication.
   available while safe-save is active. Identity defaults to
   `nyx-device-identity.nyx` (`NYX_DEVICE_IDENTITY_PATH`), while MLS state remains
   `nyx-desktop-state.nyx` (`NYX_DESKTOP_STATE_PATH`).
-- The workspace currently has thirty-five store/crypto/transport/mailbox/protocol/UI unit tests
-  covering MLS group/Welcome/message processing, replay rejection, device
+- The workspace test suite covers store/crypto/transport/mailbox/protocol/UI
+  behavior including MLS group/Welcome/message processing, replay rejection, device
   material validation, request serialization,
   oversized-frame rejection, receipt binding, mailbox lifecycle, cross-mailbox
   ACK isolation, Onion endpoint validation, snapshot v1/v2 migration, idempotent
@@ -157,6 +167,9 @@ not suitable for sensitive or production communication.
 - The live-Tor smoke test is manual and has not been automated in CI. There are
   no parser fuzz tests, load tests, backup/restore procedures, deployment
   manifests, or monitoring.
+- Android QR scanning depends on camera permission and the system WebView's
+  `BarcodeDetector` QR support. Device-level camera scanning and Tor bootstrap
+  still require acceptance testing on representative Android versions.
 
 ## Security limitations
 
@@ -185,10 +198,15 @@ not suitable for sensitive or production communication.
 cargo fmt --all -- --check
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
+cargo check --workspace
 ```
 
 All commands pass. A successful compile and unit-test run does not verify
 publication or reachability on the public Tor network.
+
+Desktop Linux and Android debug packages were also built in this revision. The
+Android package contains both `arm64-v8a` and `x86_64` native libraries. Generated
+packages live under the ignored `dist/` directory and are not part of Git.
 
 ## Next milestone
 
@@ -199,7 +217,7 @@ chat scenario should also become an isolated, opt-in integration test.
 ## Resume notes
 
 Start with encrypted per-contact history and remote MLS commit lifecycle handling.
-The desktop transport configuration is:
+The legacy environment-based desktop transport configuration is:
 
 ```bash
 export NYX_MAILBOX_ONION="<v3-address>.onion"

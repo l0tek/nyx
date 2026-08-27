@@ -108,9 +108,10 @@ The desktop sidebar performs a payload-free health request through Tor every ten
 seconds and displays Tor bootstrap, Onion mailbox reachability, round-trip time,
 last successful check, and delivery errors separately.
 
-Imported contacts are not yet message-enabled: the application validates and
-stores their invitation and KeyPackage, but deliberately waits for the next
-milestone's Add/Commit/Welcome exchange before creating a remote MLS session.
+Verified contacts can establish a two-member remote MLS session through the
+signed invitation acceptance and Welcome flow. The same signed contact
+invitation can be displayed as a QR code by desktop or Android and scanned with
+the Android camera. Identity backup is intentionally not part of this QR flow.
 
 ## Security rule
 
