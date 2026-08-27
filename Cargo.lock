@@ -4821,7 +4821,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arti-client",
+ "futures",
+ "nyx-protocol",
  "tokio",
+ "tor-hsservice",
+ "tor-rtcompat",
 ]
 
 [[package]]

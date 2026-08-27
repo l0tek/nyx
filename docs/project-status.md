@@ -29,17 +29,19 @@ not suitable for sensitive or production communication.
 ### Other components
 
 - The Dioxus desktop scaffold builds and runs.
+- `nyx-tor` now bootstraps an Arti client, accepts only syntactically valid v3
+  `.onion` endpoints, and implements bounded deposit/fetch/ack requests with a
+  60-second timeout. It exposes no Clearnet connection method.
 - Domain types for contacts and chat messages exist.
 - Envelope and encrypted-message serialization exists.
 - SQLite and cryptographic boundary crates exist as scaffolds.
-- The workspace currently has six mailbox/protocol unit tests covering request
+- The workspace currently has seven transport/mailbox/protocol unit tests covering request
   serialization, oversized-frame rejection, receipt binding, mailbox lifecycle,
   cross-mailbox ACK isolation, and invalid input rejection.
 
 ## Not implemented
 
-- The desktop client does not bootstrap Arti, connect to the mailbox Onion
-  Service, or send the mailbox protocol.
+- The desktop UI is not connected to the implemented `nyx-tor` transport.
 - OpenMLS session/group creation, credential handling, encryption, decryption,
   commits, and key persistence are not implemented.
 - Device identity generation, contact invitations, out-of-band verification,
@@ -53,8 +55,8 @@ not suitable for sensitive or production communication.
   tokens, global disk quotas, and production-grade abuse controls are not
   implemented.
 - There is no migration/version-management system for the mailbox database.
-- There are no integration tests against the live Tor network, fuzz tests,
-  load tests, backup/restore procedures, deployment manifests, or monitoring.
+- There are no end-to-end integration tests against the live Tor network, fuzz
+  tests, load tests, backup/restore procedures, deployment manifests, or monitoring.
 
 ## Security limitations
 
@@ -86,8 +88,7 @@ publication or reachability on the public Tor network.
 
 ## Next milestone
 
-The next useful vertical slice is a headless test client in `nyx-tor` that
-bootstraps Arti, connects only to a configured `.onion` address, exercises the
-deposit/fetch/ack flow, and is covered by an integration test. Only after that
-should the desktop UI be wired to transport. OpenMLS integration must precede
-the transmission of any real message content.
+The next useful milestone is an opt-in end-to-end test that launches a mailbox
+Onion Service and exercises the implemented `nyx-tor` deposit/fetch/ack client
+over Tor. OpenMLS identity, group, and persistence integration must then precede
+wiring real message content into the desktop UI.

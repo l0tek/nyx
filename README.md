@@ -64,10 +64,10 @@ See [`docs/project-status.md`](docs/project-status.md) for implemented features,
 known limitations, and the remaining security work.
 
 The client transport and cryptographic crates intentionally contain explicit
-TODO boundaries. The server-side Arti Onion Service and opaque mailbox storage
-are implemented, but the desktop client is not connected to them. Do not replace
-the crypto boundary with ad-hoc cryptography. Integrate and test OpenMLS before
-enabling real user messaging.
+TODO boundaries. The server-side Arti Onion Service, opaque mailbox storage, and
+headless `nyx-tor` mailbox client are implemented, but the desktop UI is not
+connected to them. Do not replace the crypto boundary with ad-hoc cryptography.
+Integrate and test OpenMLS before enabling real user messaging.
 
 ## Security rule
 

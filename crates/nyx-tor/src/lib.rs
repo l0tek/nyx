@@ -3,7 +3,18 @@
 //! Security invariant: failure to bootstrap Tor must fail closed. There is no
 //! direct TCP/Clearnet fallback path in this crate.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
+use arti_client::{TorClient, TorClientConfig};
+use futures::{AsyncReadExt, AsyncWriteExt};
+use nyx_protocol::{
+    Envelope, MAX_FRAME_SIZE, MailboxRequest, MailboxResponse, StoredEnvelope, decode_response,
+    encode_request,
+};
+use std::{sync::Arc, time::Duration};
+use tor_hsservice::HsId;
+use tor_rtcompat::PreferredRuntime;
+
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone)]
 pub struct OnionEndpoint {
@@ -14,19 +25,134 @@ pub struct OnionEndpoint {
 impl OnionEndpoint {
     pub fn new(host: impl Into<String>, port: u16) -> Result<Self> {
         let host = host.into();
-        if !host.ends_with(".onion") {
-            bail!("Tor-only mode accepts .onion endpoints only");
+        host.parse::<HsId>()
+            .context("Tor-only mode requires a valid v3 .onion address")?;
+        if port == 0 {
+            bail!("onion endpoint port must not be zero");
         }
         Ok(Self { host, port })
     }
 }
 
-pub struct TorTransport;
+/// An Arti-backed transport that can only connect to validated Onion endpoints.
+pub struct TorTransport {
+    client: Arc<TorClient<PreferredRuntime>>,
+}
 
 impl TorTransport {
     pub async fn bootstrap() -> Result<Self> {
-        // TODO: instantiate arti_client::TorClient and bootstrap it.
-        // Keep all Arti-specific configuration inside this crate.
-        bail!("Arti bootstrap not implemented in scaffold")
+        let client = TorClient::create_bootstrapped(TorClientConfig::default())
+            .await
+            .context("bootstrap Tor")?;
+        Ok(Self { client })
+    }
+
+    pub async fn request(
+        &self,
+        endpoint: &OnionEndpoint,
+        request: &MailboxRequest,
+    ) -> Result<MailboxResponse> {
+        let operation = async {
+            // OnionEndpoint is the only accepted target type. This crate exposes no
+            // method that can connect to a Clearnet hostname or IP address.
+            let mut stream = self
+                .client
+                .connect((endpoint.host.as_str(), endpoint.port))
+                .await
+                .context("connect to mailbox onion service")?;
+            let encoded = encode_request(request).context("encode mailbox request")?;
+            let length = u32::try_from(encoded.len()).context("request frame too large")?;
+            stream.write_all(&length.to_be_bytes()).await?;
+            stream.write_all(&encoded).await?;
+            stream.flush().await?;
+
+            let mut length_bytes = [0_u8; 4];
+            stream
+                .read_exact(&mut length_bytes)
+                .await
+                .context("read response frame length")?;
+            let response_length = u32::from_be_bytes(length_bytes) as usize;
+            if response_length == 0 || response_length > MAX_FRAME_SIZE {
+                bail!("mailbox returned an invalid response frame length");
+            }
+            let mut response = vec![0_u8; response_length];
+            stream
+                .read_exact(&mut response)
+                .await
+                .context("read mailbox response")?;
+            decode_response(&response).context("decode mailbox response")
+        };
+        tokio::time::timeout(REQUEST_TIMEOUT, operation)
+            .await
+            .context("mailbox request timed out")?
+    }
+
+    pub async fn deposit(&self, endpoint: &OnionEndpoint, envelope: Envelope) -> Result<[u8; 32]> {
+        match self
+            .request(endpoint, &MailboxRequest::Deposit(envelope))
+            .await?
+        {
+            MailboxResponse::Deposited { receipt } => Ok(receipt),
+            MailboxResponse::Error(code) => bail!("mailbox rejected deposit: {code:?}"),
+            _ => bail!("mailbox returned an unexpected response to deposit"),
+        }
+    }
+
+    pub async fn fetch(
+        &self,
+        endpoint: &OnionEndpoint,
+        mailbox_token: [u8; 32],
+        limit: u16,
+    ) -> Result<Vec<StoredEnvelope>> {
+        match self
+            .request(
+                endpoint,
+                &MailboxRequest::Fetch {
+                    mailbox_token,
+                    limit,
+                },
+            )
+            .await?
+        {
+            MailboxResponse::Messages(messages) => Ok(messages),
+            MailboxResponse::Error(code) => bail!("mailbox rejected fetch: {code:?}"),
+            _ => bail!("mailbox returned an unexpected response to fetch"),
+        }
+    }
+
+    pub async fn acknowledge(
+        &self,
+        endpoint: &OnionEndpoint,
+        mailbox_token: [u8; 32],
+        receipts: Vec<[u8; 32]>,
+    ) -> Result<u16> {
+        match self
+            .request(
+                endpoint,
+                &MailboxRequest::Acknowledge {
+                    mailbox_token,
+                    receipts,
+                },
+            )
+            .await?
+        {
+            MailboxResponse::Acknowledged { deleted } => Ok(deleted),
+            MailboxResponse::Error(code) => bail!("mailbox rejected acknowledgement: {code:?}"),
+            _ => bail!("mailbox returned an unexpected response to acknowledgement"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_only_onion_endpoints() {
+        let valid = "25njqamcweflpvkl73j4szahhihoc4xt3ktcgjnpaingr5yhkenl5sid.onion";
+        assert!(OnionEndpoint::new(valid, 443).is_ok());
+        assert!(OnionEndpoint::new("example.com", 443).is_err());
+        assert!(OnionEndpoint::new("127.0.0.1", 443).is_err());
+        assert!(OnionEndpoint::new(valid, 0).is_err());
     }
 }
