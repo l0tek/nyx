@@ -115,6 +115,7 @@ button, input { font: inherit; }
 
 #[derive(Clone)]
 struct DisplayMessage {
+    contact_device_id: Option<uuid::Uuid>,
     plaintext: String,
     ciphertext_size: usize,
     queued: bool,
@@ -213,6 +214,7 @@ pub fn App() -> Element {
     let mut invitation_output = use_signal(String::new);
     let mut invitation_input = use_signal(String::new);
     let mut contact_status = use_signal(|| None::<String>);
+    let mut reconnect_confirm = use_signal(|| None::<uuid::Uuid>);
     let mut mobile_menu_open = use_signal(|| false);
     let mut app_view = use_signal(|| AppView::Status);
     let mut back_history = use_signal(Vec::<AppView>::new);
@@ -286,6 +288,8 @@ pub fn App() -> Element {
             messages,
             last_error,
             autosave_password,
+            selected_contact,
+            app_view,
         )
     });
     use_future(move || {
@@ -335,6 +339,13 @@ pub fn App() -> Element {
     });
     let keydown_contact = active_contact.clone();
     let click_contact = active_contact.clone();
+    let active_contact_id = active_contact.as_ref().map(|contact| contact.device_id);
+    let visible_messages = messages
+        .read()
+        .iter()
+        .filter(|message| message.contact_device_id == active_contact_id)
+        .cloned()
+        .collect::<Vec<_>>();
     let current_screen = match *app_view.read() {
         AppView::Status => "Status",
         AppView::Chat => active_contact
@@ -503,6 +514,7 @@ pub fn App() -> Element {
                         p { class: "transport-state", "{mailbox_status.detail}" }
                         p { class: "transport-state", "{mailbox_last_success}" }
                         if let Some(endpoint) = mailbox_status.endpoint.as_ref() { p { class: "transport-endpoint", "{endpoint}" } }
+                        if let Some(error) = last_error.read().as_ref() { div { class: "error", "{error}" } }
                         div { class: "identity-card", strong { "{profile_name}" } div { class: "fingerprint", "{profile_fingerprint}" } }
                     }
                 } else if *app_view.read() == AppView::Configuration {
@@ -618,6 +630,32 @@ pub fn App() -> Element {
                                         "Einladung annehmen und Verbindung aufbauen"
                                     }
                                 }
+                                if *reconnect_confirm.read() == Some(contact.device_id) {
+                                    p { class: "warning", "Der bisherige Kontakt und seine lokale MLS-Sitzung werden entfernt. Danach muss ein neuer QR-Code importiert werden." }
+                                    button {
+                                        class: "mini-button",
+                                        onclick: {
+                                            let device_id = contact.device_id;
+                                            move |_| {
+                                                if remove_contact_for_reconnect(&mut identity, device_id, autosave_password, recipient_mailbox_token, local_mailbox_token, &mut selected_contact, &mut contact_status) {
+                                                    reconnect_confirm.set(None);
+                                                    navigate_to(&mut app_view, AppView::ContactImport, &mut back_history, &mut forward_history);
+                                                }
+                                            }
+                                        },
+                                        "Entfernen und neu verbinden"
+                                    }
+                                    button { class: "mini-button", onclick: move |_| reconnect_confirm.set(None), "Abbrechen" }
+                                } else {
+                                    button {
+                                        class: "mini-button",
+                                        onclick: {
+                                            let device_id = contact.device_id;
+                                            move |_| reconnect_confirm.set(Some(device_id))
+                                        },
+                                        "Kontakt neu verbinden"
+                                    }
+                                }
                             }
                         } else if messages.read().is_empty() {
                             div { class: "empty",
@@ -625,7 +663,7 @@ pub fn App() -> Element {
                                 p { "Invitations are Ed25519-signed, carry a validated RFC 9420 KeyPackage and use separate mailbox capabilities for each direction." }
                             }
                         }
-                        for (index, message) in messages.read().iter().enumerate() {
+                        for (index, message) in visible_messages.iter().enumerate() {
                             div { class: if message.incoming { "bubble incoming" } else { "bubble" }, key: "{index}",
                                 p { "{message.plaintext}" }
                                 div { class: "meta",
@@ -772,6 +810,8 @@ async fn run_delivery_worker(
     mut messages: Signal<Vec<DisplayMessage>>,
     mut last_error: Signal<Option<String>>,
     autosave_password: Signal<Zeroizing<Vec<u8>>>,
+    mut selected_contact: Signal<Option<uuid::Uuid>>,
+    mut app_view: Signal<AppView>,
 ) {
     while !*startup_ready.read() {
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -923,20 +963,38 @@ async fn run_delivery_worker(
                     ),
                 }
             }
+            let fallback_tokens = local_mailbox_token.read().clone();
+            let mut receive_tokens = Vec::new();
+            if let Some(device) = identity.read().as_ref().ok().and_then(Option::as_ref) {
+                for invitation in device.issued_invitations().iter().rev() {
+                    add_receive_token(&mut receive_tokens, invitation.inviter_receive_token);
+                }
+                for contact in device.contacts().iter().rev() {
+                    add_receive_token(&mut receive_tokens, contact.receive_mailbox_token);
+                }
+            }
+            for token in fallback_tokens {
+                add_receive_token(&mut receive_tokens, token);
+            }
             match transport.flush_delivery_queue(&endpoint, &queue, 32).await {
                 Ok(report) if report.delivered > 0 => update_connection_detail(
                     &mut status,
                     format!("Delivered {} queued message(s)", report.delivered),
                 ),
-                Ok(_) => update_connection_detail(&mut status, "Delivery queue is empty".into()),
+                Ok(_) => update_connection_detail(
+                    &mut status,
+                    format!(
+                        "Delivery queue is empty · checking {} inbox(es)",
+                        receive_tokens.len()
+                    ),
+                ),
                 Err(error) => update_connection_detail(
                     &mut status,
                     format!("Delivery failed; queued for retry: {error}"),
                 ),
             }
 
-            let receive_tokens = local_mailbox_token.read().clone();
-            for token in receive_tokens {
+            'inboxes: for token in receive_tokens {
                 match transport.fetch(&endpoint, token, 32).await {
                     Ok(envelopes) => {
                         let mut receipts = Vec::new();
@@ -983,11 +1041,16 @@ async fn run_delivery_worker(
                                                     identity_path(),
                                                     autosave_password.read().as_slice(),
                                                 )?;
-                                                Ok(format!(
-                                                    "MLS session established with {}",
-                                                    contact.display_name
-                                                )
-                                                .into_bytes())
+                                                selected_contact.set(Some(contact.device_id));
+                                                app_view.set(AppView::Chat);
+                                                Ok((
+                                                    format!(
+                                                        "Neue Kontaktanfrage von {} angenommen",
+                                                        contact.display_name
+                                                    )
+                                                    .into_bytes(),
+                                                    Some(contact.device_id),
+                                                ))
                                             })
                                             .map_err(|error| error.to_string()),
                                         Err(error) => Err(error),
@@ -1005,16 +1068,25 @@ async fn run_delivery_worker(
                                                 .ok_or_else(|| "Device is locked".to_owned())
                                         },
                                     ) {
-                                        Ok(device) => device
-                                            .process_remote_inbound_and_save(
-                                                sender_device,
-                                                &ciphertext,
-                                                stored.receipt,
-                                                stored.expires_unix_ms,
-                                                identity_path(),
-                                                autosave_password.read().as_slice(),
-                                            )
-                                            .map_err(|error| error.to_string()),
+                                        Ok(device) => {
+                                            if !device.has_session(sender_device) {
+                                                // A contact acceptance may be waiting in another
+                                                // inbox. Leave this message untouched and keep
+                                                // searching for the handshake first.
+                                                continue;
+                                            }
+                                            device
+                                                .process_remote_inbound_and_save(
+                                                    sender_device,
+                                                    &ciphertext,
+                                                    stored.receipt,
+                                                    stored.expires_unix_ms,
+                                                    identity_path(),
+                                                    autosave_password.read().as_slice(),
+                                                )
+                                                .map(|plaintext| (plaintext, Some(sender_device)))
+                                                .map_err(|error| error.to_string())
+                                        }
                                         Err(error) => Err(error),
                                     }
                                 }
@@ -1027,15 +1099,17 @@ async fn run_delivery_worker(
                                             state_path(),
                                             autosave_password.read().as_slice(),
                                         )
+                                        .map(|plaintext| (plaintext, None))
                                         .map_err(|error| error.to_string()),
                                     Err(error) => Err(error.clone()),
                                 },
                             };
                             match decrypted {
-                                Ok(plaintext) => {
+                                Ok((plaintext, contact_device_id)) => {
                                     receipts.push(stored.receipt);
                                     match String::from_utf8(plaintext) {
                                         Ok(plaintext) => messages.write().push(DisplayMessage {
+                                            contact_device_id,
                                             plaintext,
                                             ciphertext_size: stored.envelope.ciphertext.len(),
                                             queued: false,
@@ -1046,8 +1120,16 @@ async fn run_delivery_worker(
                                         )),
                                     }
                                 }
-                                Err(error) => last_error
-                                    .set(Some(format!("Inbound MLS message rejected: {error}"))),
+                                Err(error) => {
+                                    last_error.set(Some(format!(
+                                        "Inbound MLS message rejected: {error}"
+                                    )));
+                                    // Preserve the first causal failure. Later
+                                    // application messages depend on a preceding
+                                    // successful invitation acceptance and would
+                                    // otherwise overwrite the useful error.
+                                    break 'inboxes;
+                                }
                             }
                         }
                         if !receipts.is_empty() {
@@ -1479,6 +1561,52 @@ fn add_receive_token(tokens: &mut Vec<[u8; 32]>, token: [u8; 32]) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn remove_contact_for_reconnect(
+    identity: &mut Signal<Result<Option<DeviceIdentity>, String>>,
+    device_id: uuid::Uuid,
+    autosave_password: Signal<Zeroizing<Vec<u8>>>,
+    mut recipient_token: Signal<Option<[u8; 32]>>,
+    mut local_tokens: Signal<Vec<[u8; 32]>>,
+    selected_contact: &mut Signal<Option<uuid::Uuid>>,
+    status: &mut Signal<Option<String>>,
+) -> bool {
+    let result = (|| -> Result<ContactRecord, String> {
+        let mut state = identity.write();
+        let device = state
+            .as_mut()
+            .map_err(|error| error.clone())?
+            .as_mut()
+            .ok_or_else(|| "Device is locked".to_owned())?;
+        let removed = device
+            .remove_contact(device_id)
+            .map_err(|error| error.to_string())?;
+        device
+            .save_encrypted(identity_path(), autosave_password.read().as_slice())
+            .map_err(|error| error.to_string())?;
+        Ok(removed)
+    })();
+    match result {
+        Ok(removed) => {
+            local_tokens
+                .write()
+                .retain(|token| token != &removed.receive_mailbox_token);
+            recipient_token.set(None);
+            selected_contact.set(None);
+            status.set(Some(
+                "Alter Kontakt entfernt. Importiere jetzt den neuen QR-Code.".into(),
+            ));
+            true
+        }
+        Err(error) => {
+            status.set(Some(format!(
+                "Kontakt konnte nicht entfernt werden: {error}"
+            )));
+            false
+        }
+    }
+}
+
 fn verify_contact_fingerprint(
     identity: &mut Signal<Result<Option<DeviceIdentity>, String>>,
     device_id: uuid::Uuid,
@@ -1608,6 +1736,7 @@ fn send_remote_message(
     match result {
         Ok(ciphertext_size) => {
             messages.write().push(DisplayMessage {
+                contact_device_id: Some(contact.device_id),
                 plaintext,
                 ciphertext_size,
                 queued: true,

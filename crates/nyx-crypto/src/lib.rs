@@ -565,6 +565,23 @@ impl DeviceIdentity {
         Ok(())
     }
 
+    pub fn remove_contact(&mut self, device_id: Uuid) -> Result<ContactRecord> {
+        let index = self
+            .snapshot
+            .contacts
+            .iter()
+            .position(|contact| contact.device_id == device_id)
+            .ok_or_else(|| anyhow::anyhow!("contact does not exist"))?;
+        let contact = self.snapshot.contacts.remove(index);
+        self.snapshot
+            .sessions
+            .retain(|session| session.contact_device_id != device_id);
+        self.snapshot
+            .remote_pending_outbound
+            .retain(|pending| pending.mailbox_token != contact.send_mailbox_token);
+        Ok(contact)
+    }
+
     /// Accept an imported invitation, create the two-member MLS group and
     /// return a signed Welcome response ready for opaque mailbox transport.
     pub fn accept_invitation(&mut self, device_id: Uuid) -> Result<Vec<u8>> {
@@ -1884,6 +1901,28 @@ mod tests {
         assert_eq!(restored.contacts().len(), 1);
         assert!(restored.contacts()[0].verified);
         assert_eq!(restored.contacts()[0].device_id, alice.device_id());
+    }
+
+    #[test]
+    fn removed_contact_can_be_imported_again() {
+        let onion = "25njqamcweflpvkl73j4szahhihoc4xt3ktcgjnpaingr5yhkenl5sid.onion";
+        let mut alice = DeviceIdentity::generate("Alice").unwrap();
+        let invitation = alice.create_invitation(onion).unwrap();
+        let mut bob = DeviceIdentity::generate("Bob").unwrap();
+        let contact = bob.import_invitation(&invitation).unwrap();
+        bob.mark_contact_verified(contact.device_id).unwrap();
+        bob.accept_invitation(contact.device_id).unwrap();
+
+        let removed = bob.remove_contact(contact.device_id).unwrap();
+        assert_eq!(removed.device_id, contact.device_id);
+        assert!(bob.contacts().is_empty());
+        assert!(!bob.has_session(contact.device_id));
+
+        let replacement = alice.create_invitation(onion).unwrap();
+        assert_eq!(
+            bob.import_invitation(&replacement).unwrap().device_id,
+            contact.device_id
+        );
     }
 
     #[test]

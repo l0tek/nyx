@@ -44,6 +44,11 @@ not suitable for sensitive or production communication.
   Contact invitations can be exported as a visible QR code on desktop and
   Android. Android can scan the same signed contact QR invitation with its
   camera; this is contact exchange only and does not export the local identity.
+- Android uses a status header with back/forward navigation and a hamburger
+  drawer containing configuration, contact import/export, and imported contacts.
+  Successful import opens the contact verification screen directly. A confirmed
+  reconnect action can remove an obsolete contact and local MLS session before
+  importing a replacement invitation.
 - Configuration is available from the Dioxus menu. The bundled default mailbox
   Onion address is shown there and can be edited; additional mailbox entries can
   be added, selected, changed, and persisted locally on desktop and Android.
@@ -112,6 +117,13 @@ not suitable for sensitive or production communication.
   failures queued, and reports bootstrap/delivery/retry state. Arti client state
   and cache are placed below the application data directory so Android does not
   depend on an unavailable process working directory during bootstrap.
+- The worker restores receive capabilities for every contact and every issued
+  invitation, reads them directly from the unlocked encrypted identity on each
+  cycle, and prioritizes recent invitations. Application messages without an
+  established remote session remain unacknowledged while contact handshakes are
+  sought in the other inboxes.
+- Displayed messages carry a contact device ID; the chat view filters them by
+  the selected contact instead of mixing all conversations into one timeline.
 - The sidebar exposes structured connection state for Tor bootstrap and Onion
   mailbox reachability, the configured endpoint, health-check latency, delivery
   detail, and time since the last successful mailbox check. A failed health check
@@ -171,6 +183,19 @@ not suitable for sensitive or production communication.
   `BarcodeDetector` QR support. Device-level camera scanning and Tor bootstrap
   still require acceptance testing on representative Android versions.
 
+## Current live integration blocker
+
+- A real Android-to-desktop handshake remains unresolved. Both clients report
+  the Onion mailbox as connected. The server stores a correctly framed signed
+  `InvitationAcceptance` before the subsequent `MlsApplication` payloads, but
+  the desktop still reports `remote MLS session is not established` and does
+  not create/show the incoming phone contact.
+- The desktop restores twelve inbox capabilities. Diagnostic work confirmed
+  that the relevant acceptance and later messages remain unacknowledged in the
+  mailbox. The next step is privacy-safe per-inbox payload-kind tracing to prove
+  which capability is processed first and why the acceptance-bearing inbox is
+  not establishing its MLS session.
+
 ## Security limitations
 
 - Mailbox SQLite pages are not encrypted at rest. Stored message bodies are
@@ -201,7 +226,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo check --workspace
 ```
 
-All commands pass. A successful compile and unit-test run does not verify
+All commands pass, including 37 workspace tests. A successful compile and unit-test run does not verify
 publication or reachability on the public Tor network.
 
 Desktop Linux and Android debug packages were also built in this revision. The
@@ -210,13 +235,17 @@ packages live under the ignored `dist/` directory and are not part of Git.
 
 ## Next milestone
 
-The next useful milestone is durable encrypted message history plus MLS update,
-removal, and KeyPackage-rotation handling. A two-desktop live-Tor acceptance and
-chat scenario should also become an isolated, opt-in integration test.
+The immediate milestone is resolving the Android-to-desktop invitation
+acceptance ordering/selection blocker and converting that reproduction into an
+isolated live-Tor integration test. Durable encrypted message history plus MLS
+update, removal, and KeyPackage rotation follow afterward.
 
 ## Resume notes
 
-Start with encrypted per-contact history and remote MLS commit lifecycle handling.
+Start with privacy-safe per-inbox payload-kind tracing for the pending
+Android-to-desktop acceptance. Do not delete the queued mailbox rows before the
+failure is understood. Then continue with encrypted per-contact history and
+remote MLS commit lifecycle handling.
 The legacy environment-based desktop transport configuration is:
 
 ```bash
