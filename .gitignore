@@ -6,5 +6,6 @@
 *.key
 *.pem
 *.onion-secret
+*.nyx
 .env
 state/

@@ -46,12 +46,19 @@ not suitable for sensitive or production communication.
 - `nyx-crypto` creates a two-member group, adds the peer KeyPackage, serializes
   and processes the Welcome, verifies matching epoch authenticators, exchanges
   encrypted application messages, and rejects replayed messages.
+- Both OpenMLS provider stores, the group identifier, and signer references can
+  be serialized into the encrypted blob store and restored through
+  `MlsGroup::load`. A test verifies continued message ratchets after restore and
+  rejection of an incorrect password.
 - `nyx-store` provides an authenticated encrypted-blob format using Argon2id
   and XChaCha20-Poly1305. Headers are authenticated, derived keys and loaded
   plaintext are zeroized, files are atomically replaced, and Unix temporary
   files use mode `0600`.
 - The generic SQLite client-store boundary remains a separate scaffold.
-- The workspace currently has fourteen store/crypto/transport/mailbox/protocol unit tests
+- The desktop sidebar provides explicit Save and Unlock actions for this MLS
+  state. The vault password is zeroized after each operation. The location is
+  `nyx-desktop-state.nyx` or `NYX_DESKTOP_STATE_PATH` when configured.
+- The workspace currently has fifteen store/crypto/transport/mailbox/protocol unit tests
   covering MLS group/Welcome/message processing, replay rejection, device
   material validation, request serialization,
   oversized-frame rejection, receipt binding, mailbox lifecycle, cross-mailbox
@@ -66,9 +73,11 @@ not suitable for sensitive or production communication.
   two-member MLS conversation is volatile and recreated on app start.
 - Device identity generation, contact invitations, out-of-band verification,
   and multi-device behavior are not implemented.
-- The encrypted blob store is not yet connected to OpenMLS's storage traits or
-  the desktop lifecycle. The generic client SQLite `kv` store remains
-  unencrypted and must not hold secrets.
+- Persistence is manual; there is no automatic save, locking timer, password
+  strength meter, operating-system keyring integration, or recovery mechanism.
+  Displayed UI history is not part of the MLS snapshot.
+- The generic client SQLite `kv` store remains unencrypted and must not hold
+  secrets.
 - Attachment transfer, padding buckets, batching, cover traffic, token
   rotation, retries, encrypted ACK payloads, and optional direct peer Onion
   Services are not implemented.
@@ -97,6 +106,9 @@ not suitable for sensitive or production communication.
   permissions and encryption.
 - No security audit, dependency audit, parser fuzzing, or log-redaction audit
   has been completed.
+- The MLS snapshot currently mirrors OpenMLS MemoryStorage's internal key/value
+  representation. It is versioned by Nyx but still needs explicit migration
+  tests before OpenMLS dependency upgrades.
 
 ## Verified in this revision
 
@@ -110,7 +122,7 @@ publication or reachability on the public Tor network.
 
 ## Next milestone
 
-The next useful milestone is connecting the encrypted blob format to device
-keys and OpenMLS group state, followed by a queue that moves serialized MLS
-messages between the desktop app and `nyx-tor`. The manual live-Tor smoke test
-should later become an isolated, opt-in CI job.
+The next useful milestone is a queue that moves serialized MLS messages between
+the desktop app and `nyx-tor`, with delivery state stored outside the MLS secret
+snapshot. Automatic safe-save and lock behavior should follow. The manual
+live-Tor smoke test should later become an isolated, opt-in CI job.

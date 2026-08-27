@@ -1,5 +1,7 @@
 use dioxus::prelude::*;
 use nyx_crypto::MlsConversation;
+use std::path::PathBuf;
+use zeroize::Zeroize;
 
 const CSS: &str = r#"
 :root { font-family: Inter, system-ui, sans-serif; background: #090d12; color: #e6edf3; }
@@ -33,6 +35,12 @@ button, input { font: inherit; }
 .composer button { border: 0; border-radius: 10px; padding: 0 20px; color: #061018; background: #8dd39e; font-weight: 700; cursor: pointer; }
 .composer button:disabled { opacity: .4; cursor: default; }
 .warning { margin-top: 26px; color: #d8b96e; font-size: 12px; line-height: 1.5; }
+.vault { margin-top: 28px; padding-top: 20px; border-top: 1px solid #26303a; }
+.vault input { width: 100%; color: #edf4fa; background: #0a1016; border: 1px solid #33404d; border-radius: 9px; padding: 10px; margin: 9px 0; }
+.vault-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.vault button { color: #cdd9e3; background: #1a2530; border: 1px solid #33404d; border-radius: 8px; padding: 8px; cursor: pointer; }
+.vault button:disabled { opacity: .4; cursor: default; }
+.vault-result { color: #91abc1; font-size: 11px; margin-top: 9px; overflow-wrap: anywhere; }
 @media (max-width: 760px) { .app { grid-template-columns: 1fr; } .sidebar { display: none; } .main { padding: 12px; } .panel { min-height: calc(100vh - 24px); } }
 "#;
 
@@ -51,6 +59,8 @@ pub fn App() -> Element {
     let mut draft = use_signal(String::new);
     let mut messages = use_signal(Vec::<DisplayMessage>::new);
     let mut last_error = use_signal(|| None::<String>);
+    let mut vault_password = use_signal(String::new);
+    let mut vault_status = use_signal(|| None::<String>);
 
     let mls_ready = conversation.read().is_ok();
     let member_count = conversation
@@ -75,7 +85,31 @@ pub fn App() -> Element {
                     span { "1:1 · {member_count} MLS members" }
                 }
                 p { class: "warning",
-                    "Local cryptographic demo. Tor mailbox delivery and encrypted key persistence are not connected to this UI yet."
+                    "Local cryptographic demo. Tor mailbox delivery is not connected to this UI yet."
+                }
+                div { class: "vault",
+                    div { class: "eyebrow", "Encrypted MLS state" }
+                    input {
+                        r#type: "password",
+                        value: "{vault_password}",
+                        placeholder: "Vault password",
+                        oninput: move |event| vault_password.set(event.value()),
+                    }
+                    div { class: "vault-actions",
+                        button {
+                            disabled: !mls_ready || vault_password.read().is_empty(),
+                            onclick: move |_| save_session(&conversation, &mut vault_password, &mut vault_status),
+                            "Save"
+                        }
+                        button {
+                            disabled: vault_password.read().is_empty(),
+                            onclick: move |_| load_session(&mut conversation, &mut vault_password, &mut messages, &mut last_error, &mut vault_status),
+                            "Unlock"
+                        }
+                    }
+                    if let Some(status) = vault_status.read().as_ref() {
+                        div { class: "vault-result", "{status}" }
+                    }
                 }
             }
             main { class: "main",
@@ -125,6 +159,52 @@ pub fn App() -> Element {
                 }
             }
         }
+    }
+}
+
+fn state_path() -> PathBuf {
+    std::env::var_os("NYX_DESKTOP_STATE_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nyx-desktop-state.nyx"))
+}
+
+fn save_session(
+    conversation: &Signal<Result<MlsConversation, String>>,
+    password: &mut Signal<String>,
+    status: &mut Signal<Option<String>>,
+) {
+    let path = state_path();
+    let result: Result<(), String> = match conversation.read().as_ref() {
+        Ok(conversation) => conversation
+            .save_encrypted(&path, password.read().as_bytes())
+            .map_err(|error| error.to_string()),
+        Err(error) => Err(error.clone()),
+    };
+    password.write().zeroize();
+    match result {
+        Ok(()) => status.set(Some(format!("Saved encrypted state to {}", path.display()))),
+        Err(error) => status.set(Some(format!("Save failed: {error}"))),
+    }
+}
+
+fn load_session(
+    conversation: &mut Signal<Result<MlsConversation, String>>,
+    password: &mut Signal<String>,
+    messages: &mut Signal<Vec<DisplayMessage>>,
+    last_error: &mut Signal<Option<String>>,
+    status: &mut Signal<Option<String>>,
+) {
+    let path = state_path();
+    let result = MlsConversation::load_encrypted(&path, password.read().as_bytes());
+    password.write().zeroize();
+    match result {
+        Ok(restored) => {
+            conversation.set(Ok(restored));
+            messages.write().clear();
+            last_error.set(None);
+            status.set(Some(format!("Unlocked MLS state from {}", path.display())));
+        }
+        Err(error) => status.set(Some(format!("Unlock failed: {error}"))),
     }
 }
 

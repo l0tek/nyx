@@ -4765,10 +4765,14 @@ dependencies = [
  "anyhow",
  "argon2",
  "chacha20poly1305",
+ "nyx-store",
  "openmls",
  "openmls_basic_credential",
  "openmls_rust_crypto",
  "openmls_traits",
+ "postcard",
+ "serde",
+ "tempfile",
  "zeroize",
 ]
 
@@ -4852,6 +4856,7 @@ version = "0.1.0"
 dependencies = [
  "dioxus",
  "nyx-crypto",
+ "zeroize",
 ]
 
 [[package]]

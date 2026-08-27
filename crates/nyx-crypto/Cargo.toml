@@ -14,3 +14,9 @@ openmls.workspace = true
 openmls_rust_crypto.workspace = true
 openmls_basic_credential.workspace = true
 openmls_traits.workspace = true
+serde.workspace = true
+postcard.workspace = true
+nyx-store = { path = "../nyx-store" }
+
+[dev-dependencies]
+tempfile.workspace = true

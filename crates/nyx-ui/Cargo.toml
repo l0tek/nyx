@@ -8,3 +8,4 @@ license.workspace = true
 [dependencies]
 dioxus.workspace = true
 nyx-crypto = { path = "../nyx-crypto" }
+zeroize.workspace = true
