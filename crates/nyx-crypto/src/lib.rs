@@ -126,6 +126,49 @@ struct DeviceIdentitySnapshot {
     remote_inbound_receipts: Vec<InboundReceipt>,
     #[serde(default)]
     remote_pending_outbound: Vec<PendingOutbound>,
+    mailbox_onion: Option<String>,
+    mailboxes: Vec<String>,
+}
+
+#[derive(SerdeDeserialize)]
+struct PreviousDeviceIdentitySnapshot {
+    version: u16,
+    device_id: Uuid,
+    display_name: String,
+    identity_secret_key: [u8; 32],
+    identity_public_key: [u8; 32],
+    mls_signature_key: Vec<u8>,
+    mls_storage: HashMap<Vec<u8>, Vec<u8>>,
+    mls_key_package: Vec<u8>,
+    contacts: Vec<ContactRecord>,
+    issued_invitations: Vec<IssuedInvitation>,
+    sessions: Vec<RemoteSession>,
+    remote_inbound_receipts: Vec<InboundReceipt>,
+    remote_pending_outbound: Vec<PendingOutbound>,
+    mailbox_onion: Option<String>,
+}
+
+impl From<PreviousDeviceIdentitySnapshot> for DeviceIdentitySnapshot {
+    fn from(previous: PreviousDeviceIdentitySnapshot) -> Self {
+        let mailboxes = previous.mailbox_onion.iter().cloned().collect();
+        Self {
+            version: previous.version,
+            device_id: previous.device_id,
+            display_name: previous.display_name,
+            identity_secret_key: previous.identity_secret_key,
+            identity_public_key: previous.identity_public_key,
+            mls_signature_key: previous.mls_signature_key,
+            mls_storage: previous.mls_storage,
+            mls_key_package: previous.mls_key_package,
+            contacts: previous.contacts,
+            issued_invitations: previous.issued_invitations,
+            sessions: previous.sessions,
+            remote_inbound_receipts: previous.remote_inbound_receipts,
+            remote_pending_outbound: previous.remote_pending_outbound,
+            mailbox_onion: previous.mailbox_onion,
+            mailboxes,
+        }
+    }
 }
 
 // Snapshot layout used before remote MLS sessions were added. Postcard encodes
@@ -133,6 +176,26 @@ struct DeviceIdentitySnapshot {
 // ends before newly appended fields, so this layout is required for migration.
 #[derive(SerdeSerialize, SerdeDeserialize)]
 struct LegacyDeviceIdentitySnapshot {
+    version: u16,
+    device_id: Uuid,
+    display_name: String,
+    identity_secret_key: [u8; 32],
+    identity_public_key: [u8; 32],
+    mls_signature_key: Vec<u8>,
+    mls_storage: HashMap<Vec<u8>, Vec<u8>>,
+    mls_key_package: Vec<u8>,
+    contacts: Vec<ContactRecord>,
+    issued_invitations: Vec<IssuedInvitation>,
+    #[serde(default)]
+    sessions: Vec<RemoteSession>,
+    #[serde(default)]
+    remote_inbound_receipts: Vec<InboundReceipt>,
+    #[serde(default)]
+    remote_pending_outbound: Vec<PendingOutbound>,
+}
+
+#[derive(SerdeSerialize, SerdeDeserialize)]
+struct OriginalDeviceIdentitySnapshot {
     version: u16,
     device_id: Uuid,
     display_name: String,
@@ -158,10 +221,33 @@ impl From<LegacyDeviceIdentitySnapshot> for DeviceIdentitySnapshot {
             mls_key_package: legacy.mls_key_package,
             contacts: legacy.contacts,
             issued_invitations: legacy.issued_invitations,
+            sessions: legacy.sessions,
+            remote_inbound_receipts: legacy.remote_inbound_receipts,
+            remote_pending_outbound: legacy.remote_pending_outbound,
+            mailbox_onion: None,
+            mailboxes: Vec::new(),
+        }
+    }
+}
+
+impl From<OriginalDeviceIdentitySnapshot> for DeviceIdentitySnapshot {
+    fn from(original: OriginalDeviceIdentitySnapshot) -> Self {
+        LegacyDeviceIdentitySnapshot {
+            version: original.version,
+            device_id: original.device_id,
+            display_name: original.display_name,
+            identity_secret_key: original.identity_secret_key,
+            identity_public_key: original.identity_public_key,
+            mls_signature_key: original.mls_signature_key,
+            mls_storage: original.mls_storage,
+            mls_key_package: original.mls_key_package,
+            contacts: original.contacts,
+            issued_invitations: original.issued_invitations,
             sessions: Vec::new(),
             remote_inbound_receipts: Vec::new(),
             remote_pending_outbound: Vec::new(),
         }
+        .into()
     }
 }
 
@@ -222,6 +308,8 @@ impl DeviceIdentity {
                 sessions: Vec::new(),
                 remote_inbound_receipts: Vec::new(),
                 remote_pending_outbound: Vec::new(),
+                mailbox_onion: None,
+                mailboxes: Vec::new(),
             },
         })
     }
@@ -232,6 +320,81 @@ impl DeviceIdentity {
 
     pub fn display_name(&self) -> &str {
         &self.snapshot.display_name
+    }
+
+    pub fn mailbox_onion(&self) -> Option<&str> {
+        self.snapshot.mailbox_onion.as_deref()
+    }
+
+    pub fn mailboxes(&self) -> &[String] {
+        &self.snapshot.mailboxes
+    }
+
+    pub fn add_mailbox(&mut self, mailbox_onion: impl Into<String>) -> Result<()> {
+        let mailbox_onion = validate_onion_address(mailbox_onion.into())?;
+        if !self.snapshot.mailboxes.contains(&mailbox_onion) {
+            self.snapshot.mailboxes.push(mailbox_onion.clone());
+        }
+        self.snapshot.mailbox_onion = Some(mailbox_onion);
+        Ok(())
+    }
+
+    pub fn update_mailbox(&mut self, index: usize, mailbox_onion: impl Into<String>) -> Result<()> {
+        let mailbox_onion = validate_onion_address(mailbox_onion.into())?;
+        let previous = self
+            .snapshot
+            .mailboxes
+            .get_mut(index)
+            .ok_or_else(|| anyhow::anyhow!("mailbox does not exist"))?;
+        let was_active = self.snapshot.mailbox_onion.as_ref() == Some(previous);
+        *previous = mailbox_onion.clone();
+        if was_active {
+            self.snapshot.mailbox_onion = Some(mailbox_onion);
+        }
+        Ok(())
+    }
+
+    pub fn select_mailbox(&mut self, index: usize) -> Result<()> {
+        self.snapshot.mailbox_onion = Some(
+            self.snapshot
+                .mailboxes
+                .get(index)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("mailbox does not exist"))?,
+        );
+        Ok(())
+    }
+
+    pub fn remove_mailbox(&mut self, index: usize) -> Result<()> {
+        if index >= self.snapshot.mailboxes.len() {
+            bail!("mailbox does not exist");
+        }
+        let removed = self.snapshot.mailboxes.remove(index);
+        if self.snapshot.mailbox_onion.as_deref() == Some(&removed) {
+            self.snapshot.mailbox_onion = self.snapshot.mailboxes.first().cloned();
+        }
+        Ok(())
+    }
+
+    pub fn update_profile(
+        &mut self,
+        display_name: impl Into<String>,
+        mailbox_onion: impl Into<String>,
+    ) -> Result<()> {
+        let display_name = validate_display_name(display_name.into())?;
+        let mailbox_onion = validate_onion_address(mailbox_onion.into())?;
+        self.snapshot.display_name = display_name;
+        self.snapshot.mailbox_onion = Some(mailbox_onion);
+        if !self
+            .snapshot
+            .mailboxes
+            .contains(self.snapshot.mailbox_onion.as_ref().unwrap())
+        {
+            self.snapshot
+                .mailboxes
+                .push(self.snapshot.mailbox_onion.clone().unwrap());
+        }
+        Ok(())
     }
 
     pub fn fingerprint(&self) -> String {
@@ -722,7 +885,17 @@ impl DeviceIdentity {
             .context("load encrypted device identity")?;
         let snapshot: DeviceIdentitySnapshot = postcard::from_bytes(&encoded)
             .or_else(|error| {
+                postcard::from_bytes::<PreviousDeviceIdentitySnapshot>(&encoded)
+                    .map(Into::into)
+                    .map_err(|_| error)
+            })
+            .or_else(|error| {
                 postcard::from_bytes::<LegacyDeviceIdentitySnapshot>(&encoded)
+                    .map(Into::into)
+                    .map_err(|_| error)
+            })
+            .or_else(|error| {
+                postcard::from_bytes::<OriginalDeviceIdentitySnapshot>(&encoded)
                     .map(Into::into)
                     .map_err(|_| error)
             })
@@ -1633,7 +1806,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("legacy-identity.nyx");
         let identity = DeviceIdentity::generate("Alice").unwrap();
-        let legacy = LegacyDeviceIdentitySnapshot {
+        let legacy = OriginalDeviceIdentitySnapshot {
             version: identity.snapshot.version,
             device_id: identity.snapshot.device_id,
             display_name: identity.snapshot.display_name.clone(),

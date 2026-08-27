@@ -4872,6 +4872,8 @@ version = "0.1.0"
 dependencies = [
  "dioxus",
  "dotenvy",
+ "jni 0.21.1",
+ "ndk-context",
  "nyx-crypto",
  "nyx-protocol",
  "nyx-store",
