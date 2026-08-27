@@ -24,6 +24,8 @@ button, input { font: inherit; }
 .auth-card { width: min(460px, 100%); padding: 34px; border: 1px solid #2a3540; border-radius: 20px; background: #10161df2; box-shadow: 0 24px 70px #0008; }
 .auth-card h1 { margin: 8px 0; font-size: 34px; letter-spacing: .12em; }
 .auth-card p { color: #8c99a6; line-height: 1.55; }
+.startup-spinner { width: 46px; height: 46px; margin: 24px auto; border: 4px solid #2a3540; border-top-color: #8dd39e; border-radius: 50%; animation: nyx-spin .8s linear infinite; }
+@keyframes nyx-spin { to { transform: rotate(360deg); } }
 .field { display: grid; gap: 6px; margin-top: 16px; }
 .field label { color: #8997a5; font-size: 12px; }
 .field input, .field textarea { width: 100%; color: #edf4fa; background: #090f15; border: 1px solid #33404d; border-radius: 10px; padding: 12px; resize: vertical; }
@@ -90,8 +92,25 @@ button, input { font: inherit; }
 .navigation { width: min(850px, 100%); display: flex; gap: 8px; margin-bottom: 10px; }
 .navigation button { color: #dce7ef; background: #111922; border: 1px solid #2a3540; border-radius: 8px; padding: 7px 13px; cursor: pointer; }
 .navigation button:disabled { opacity: .35; cursor: default; }
+.screen-title { flex: 1; align-self: center; text-align: center; color: #aab7c3; font-size: 13px; font-weight: 700; }
+.hamburger { display: none; font-size: 20px; line-height: 1; }
+.mobile-drawer-backdrop { display: none; }
+.mobile-drawer { display: none; }
+.drawer-entry { padding: 13px 4px; border-bottom: 1px solid #26303a; color: #dce7ef; cursor: pointer; }
+.drawer-entry small { display: block; margin-top: 3px; color: #778593; }
+.drawer-section { margin: 20px 0 7px; color: #7d8996; font-size: 11px; text-transform: uppercase; letter-spacing: .12em; }
 .status-page { width: min(680px, 100%); align-self: flex-start; padding: 28px; border: 1px solid #26303a; border-radius: 16px; background: #0e141b; }
-@media (max-width: 760px) { .app { grid-template-columns: 1fr; } .sidebar { display: none; } .main { padding: 12px; } .panel { min-height: calc(100vh - 24px); } }
+@media (max-width: 760px) {
+  .app { grid-template-columns: 1fr; }
+  .sidebar { display: none; }
+  .main { padding: 12px; }
+  .panel { min-height: calc(100vh - 76px); }
+  .navigation { position: sticky; top: 0; z-index: 20; padding: 8px; margin: 0 0 10px; border: 1px solid #26303a; border-radius: 12px; background: #10161df5; }
+  .navigation button { min-width: 42px; padding: 8px; }
+  .hamburger { display: block; }
+  .mobile-drawer-backdrop { display: block; position: fixed; inset: 0; z-index: 30; background: #0009; }
+  .mobile-drawer { display: block; position: fixed; z-index: 31; top: 0; right: 0; width: min(330px, 88vw); height: 100vh; padding: 22px; overflow-y: auto; background: #10161d; border-left: 1px solid #33404d; box-shadow: -20px 0 50px #0008; }
+}
 "#;
 
 #[derive(Clone)]
@@ -194,6 +213,7 @@ pub fn App() -> Element {
     let mut invitation_output = use_signal(String::new);
     let mut invitation_input = use_signal(String::new);
     let mut contact_status = use_signal(|| None::<String>);
+    let mut mobile_menu_open = use_signal(|| false);
     let mut app_view = use_signal(|| AppView::Status);
     let mut back_history = use_signal(Vec::<AppView>::new);
     let mut forward_history = use_signal(Vec::<AppView>::new);
@@ -201,6 +221,8 @@ pub fn App() -> Element {
     let mut config_onion = use_signal(default_mailbox_onion);
     let mut config_status = use_signal(|| None::<String>);
     let mailbox_onion = use_signal(default_mailbox_onion);
+    let mut startup_ready = use_signal(|| false);
+    let mut startup_error = use_signal(|| None::<String>);
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     dioxus::desktop::use_muda_event_handler(move |event| {
         if event.id().0 == CONFIG_MENU_ID {
@@ -233,16 +255,29 @@ pub fn App() -> Element {
         }
     });
     let mut selected_contact = use_signal(|| None::<uuid::Uuid>);
-    let delivery_queue = use_signal(|| {
-        DeliveryQueue::open(delivery_queue_path()).map_err(|error| error.to_string())
-    });
+    let mut delivery_queue = use_signal(|| Err("Lokaler Speicher wird vorbereitet".into()));
     let recipient_mailbox_token =
         use_signal(|| token_from_environment("NYX_RECIPIENT_MAILBOX_TOKEN_HEX").ok());
-    let local_mailbox_token =
-        use_signal(|| token_from_environment("NYX_LOCAL_MAILBOX_TOKEN_HEX").ok());
+    let local_mailbox_token = use_signal(|| {
+        token_from_environment("NYX_LOCAL_MAILBOX_TOKEN_HEX")
+            .ok()
+            .into_iter()
+            .collect::<Vec<_>>()
+    });
     let transport_status = use_signal(MailboxConnectionStatus::initial);
+    use_future(move || async move {
+        let result = initialize_local_storage();
+        match result {
+            Ok(queue) => {
+                delivery_queue.set(Ok(queue));
+                startup_ready.set(true);
+            }
+            Err(error) => startup_error.set(Some(error)),
+        }
+    });
     use_future(move || {
         run_delivery_worker(
+            startup_ready,
             transport_status,
             mailbox_onion,
             local_mailbox_token,
@@ -300,10 +335,32 @@ pub fn App() -> Element {
     });
     let keydown_contact = active_contact.clone();
     let click_contact = active_contact.clone();
+    let current_screen = match *app_view.read() {
+        AppView::Status => "Status",
+        AppView::Chat => active_contact
+            .as_ref()
+            .map_or("Kontakt", |contact| contact.display_name.as_str()),
+        AppView::Configuration => "Konfiguration",
+        AppView::ContactImport => "Kontakt importieren",
+        AppView::ContactExport => "Kontakt exportieren",
+    };
 
     rsx! {
         style { {CSS} }
-        if !authenticated {
+        if !*startup_ready.read() {
+            div { class: "auth-shell",
+                section { class: "auth-card", style: "text-align:center",
+                    div { class: "eyebrow", "Nyx wird gestartet" }
+                    h1 { "NYX" }
+                    if let Some(error) = startup_error.read().as_ref() {
+                        div { class: "error", "Lokaler Speicher konnte nicht initialisiert werden: {error}" }
+                    } else {
+                        div { class: "startup-spinner", role: "progressbar", aria_label: "App wird vorbereitet" }
+                        p { "Lokale Identität und verschlüsselter Speicher werden vorbereitet …" }
+                    }
+                }
+            }
+        } else if !authenticated {
             div { class: "auth-shell",
                 section { class: "auth-card",
                     div { class: "eyebrow", "Local encrypted identity" }
@@ -402,12 +459,40 @@ pub fn App() -> Element {
             }
             main { class: "main",
                 nav { class: "navigation",
-                    button { disabled: back_history.read().is_empty(), onclick: move |_| navigate_back(&mut app_view, &mut back_history, &mut forward_history), "← Zurück" }
-                    button { disabled: forward_history.read().is_empty(), onclick: move |_| navigate_forward(&mut app_view, &mut back_history, &mut forward_history), "Vor →" }
-                    if cfg!(any(target_os = "android", target_os = "ios")) {
-                        button { onclick: move |_| navigate_to(&mut app_view, AppView::Configuration, &mut back_history, &mut forward_history), "Konfiguration" }
-                        button { onclick: move |_| navigate_to(&mut app_view, AppView::ContactImport, &mut back_history, &mut forward_history), "Import" }
-                        button { onclick: move |_| navigate_to(&mut app_view, AppView::ContactExport, &mut back_history, &mut forward_history), "Export" }
+                    button { title: "Zurück", disabled: back_history.read().is_empty(), onclick: move |_| navigate_back(&mut app_view, &mut back_history, &mut forward_history), "←" }
+                    button { title: "Vor", disabled: forward_history.read().is_empty(), onclick: move |_| navigate_forward(&mut app_view, &mut back_history, &mut forward_history), "→" }
+                    div { class: "screen-title", "{current_screen}" }
+                    button { class: "hamburger", title: "Menü", aria_label: "Menü öffnen", onclick: move |_| mobile_menu_open.set(true), "☰" }
+                }
+                if *mobile_menu_open.read() {
+                    div { class: "mobile-drawer-backdrop", onclick: move |_| mobile_menu_open.set(false) }
+                    aside { class: "mobile-drawer",
+                        div { class: "eyebrow", "Nyx Menü" }
+                        h2 { "Navigation" }
+                        div { class: "drawer-entry", onclick: move |_| { mobile_menu_open.set(false); navigate_to(&mut app_view, AppView::Status, &mut back_history, &mut forward_history); }, "Status" }
+                        div { class: "drawer-entry", onclick: move |_| { mobile_menu_open.set(false); open_configuration(&identity, &mut config_name, &mut config_onion, &mut config_status); navigate_to(&mut app_view, AppView::Configuration, &mut back_history, &mut forward_history); }, "Konfiguration" }
+                        div { class: "drawer-entry", onclick: move |_| { mobile_menu_open.set(false); navigate_to(&mut app_view, AppView::ContactImport, &mut back_history, &mut forward_history); }, "Kontakt importieren" }
+                        div { class: "drawer-entry", onclick: move |_| { mobile_menu_open.set(false); navigate_to(&mut app_view, AppView::ContactExport, &mut back_history, &mut forward_history); }, "Kontakt exportieren" }
+                        div { class: "drawer-section", "Importierte Kontakte" }
+                        if contacts.is_empty() {
+                            div { class: "drawer-entry", small { "Noch keine Kontakte importiert" } }
+                        }
+                        for contact in contacts.iter() {
+                            div {
+                                class: "drawer-entry",
+                                key: "drawer-{contact.device_id}",
+                                onclick: {
+                                    let contact = contact.clone();
+                                    move |_| {
+                                        select_contact(&contact, &mut selected_contact, recipient_mailbox_token, local_mailbox_token);
+                                        mobile_menu_open.set(false);
+                                        navigate_to(&mut app_view, AppView::Chat, &mut back_history, &mut forward_history);
+                                    }
+                                },
+                                "{contact.display_name}"
+                                small { if contact.verified { "Fingerprint bestätigt" } else { "Bestätigung erforderlich" } }
+                            }
+                        }
                     }
                 }
                 if *app_view.read() == AppView::Status {
@@ -485,7 +570,16 @@ pub fn App() -> Element {
                             video { id: "nyx-contact-qr-camera", autoplay: true, playsinline: true, style: "display:none; width:100%; margin-top:12px; border-radius:10px" }
                             button { class: "primary", onclick: move |_| { spawn(scan_contact_qr(invitation_input, contact_status)); }, "QR-Code mit Kamera scannen" }
                         }
-                        button { class: "primary", disabled: invitation_input.read().trim().is_empty(), onclick: move |_| import_contact_invitation(&mut identity, autosave_password, &mut invitation_input, &mut contact_status, recipient_mailbox_token, local_mailbox_token, &mut selected_contact), "Prüfen und importieren" }
+                        button {
+                            class: "primary",
+                            disabled: invitation_input.read().trim().is_empty(),
+                            onclick: move |_| {
+                                if import_contact_invitation(&mut identity, autosave_password, &mut invitation_input, &mut contact_status, recipient_mailbox_token, local_mailbox_token, &mut selected_contact) {
+                                    navigate_to(&mut app_view, AppView::Chat, &mut back_history, &mut forward_history);
+                                }
+                            },
+                            "Prüfen und importieren"
+                        }
                         if let Some(status) = contact_status.read().as_ref() { div { class: "tool-status", "{status}" } }
                     }
                 } else {
@@ -501,9 +595,9 @@ pub fn App() -> Element {
                         if let Some(contact) = active_contact.as_ref() {
                             div { class: "empty",
                                 h3 { "{contact.display_name}" }
-                                p { "Signed invitation and MLS KeyPackage imported. Compare this fingerprint out of band before establishing a remote MLS session:" }
+                                p { "Kontakt importiert. Vergleiche diesen Fingerprint über einen zweiten, vertrauenswürdigen Kanal mit deinem Kontakt:" }
                                 div { class: "fingerprint", "{contact.identity_fingerprint}" }
-                                p { if remote_session_ready { "The signed MLS Welcome was processed. This remote session is ready." } else if contact.verified { "Identity verified. Accept the invitation to create the MLS session and send its signed Welcome." } else { "Verify the identity fingerprint before accepting this invitation." } }
+                                p { if remote_session_ready { "Die verschlüsselte MLS-Verbindung ist bereit." } else if contact.verified { "Fingerprint bestätigt. Nimm jetzt die Einladung an, um die verschlüsselte Verbindung aufzubauen." } else { "Wenn beide Fingerprints übereinstimmen, bestätige den Vergleich mit dem Button." } }
                                 if !contact.verified {
                                     button {
                                         class: "mini-button",
@@ -511,7 +605,7 @@ pub fn App() -> Element {
                                             let device_id = contact.device_id;
                                             move |_| verify_contact_fingerprint(&mut identity, device_id, autosave_password, &mut contact_status)
                                         },
-                                        "I compared this fingerprint"
+                                        "Fingerprint stimmt überein"
                                     }
                                 }
                                 if contact.verified && !remote_session_ready {
@@ -521,7 +615,7 @@ pub fn App() -> Element {
                                             let device_id = contact.device_id;
                                             move |_| accept_contact_invitation(&mut identity, device_id, autosave_password, &delivery_queue, &mut contact_status)
                                         },
-                                        "Accept & send MLS Welcome"
+                                        "Einladung annehmen und Verbindung aufbauen"
                                     }
                                 }
                             }
@@ -600,6 +694,17 @@ fn delivery_queue_path() -> PathBuf {
         .unwrap_or_else(|| app_data_path("nyx-delivery.sqlite3"))
 }
 
+fn initialize_local_storage() -> Result<DeliveryQueue, String> {
+    let identity = identity_path();
+    let parent = identity
+        .parent()
+        .ok_or_else(|| "App-Datenverzeichnis ist nicht verfügbar".to_owned())?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("App-Datenverzeichnis kann nicht erstellt werden: {error}"))?;
+    DeliveryQueue::open(delivery_queue_path())
+        .map_err(|error| format!("Nachrichtenwarteschlange kann nicht geöffnet werden: {error}"))
+}
+
 #[cfg(not(target_os = "android"))]
 fn app_data_path(filename: &str) -> PathBuf {
     PathBuf::from(filename)
@@ -658,15 +763,19 @@ fn default_mailbox_onion() -> String {
 
 #[allow(clippy::too_many_arguments)]
 async fn run_delivery_worker(
+    startup_ready: Signal<bool>,
     mut status: Signal<MailboxConnectionStatus>,
     mailbox_onion: Signal<String>,
-    local_mailbox_token: Signal<Option<[u8; 32]>>,
+    local_mailbox_token: Signal<Vec<[u8; 32]>>,
     mut conversation: Signal<Result<MlsConversation, String>>,
     mut identity: Signal<Result<Option<DeviceIdentity>, String>>,
     mut messages: Signal<Vec<DisplayMessage>>,
     mut last_error: Signal<Option<String>>,
     autosave_password: Signal<Zeroizing<Vec<u8>>>,
 ) {
+    while !*startup_ready.read() {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     let host = mailbox_onion.read().trim().to_owned();
     if host.is_empty() {
         return;
@@ -826,7 +935,8 @@ async fn run_delivery_worker(
                 ),
             }
 
-            if let Some(token) = *local_mailbox_token.read() {
+            let receive_tokens = local_mailbox_token.read().clone();
+            for token in receive_tokens {
                 match transport.fetch(&endpoint, token, 32).await {
                     Ok(envelopes) => {
                         let mut receipts = Vec::new();
@@ -1001,7 +1111,7 @@ fn authenticate_account(
     mut autosave_password: Signal<Zeroizing<Vec<u8>>>,
     last_activity: &mut Signal<Option<Instant>>,
     mut recipient_token: Signal<Option<[u8; 32]>>,
-    mut local_token: Signal<Option<[u8; 32]>>,
+    mut local_token: Signal<Vec<[u8; 32]>>,
     mut mailbox_onion: Signal<String>,
     selected_contact: &mut Signal<Option<uuid::Uuid>>,
     status: &mut Signal<Option<String>>,
@@ -1052,9 +1162,16 @@ fn authenticate_account(
             if let Some(onion) = device.mailbox_onion() {
                 mailbox_onion.set(onion.to_owned());
             }
+            let mut receive_tokens = local_token.read().clone();
+            for contact in device.contacts() {
+                add_receive_token(&mut receive_tokens, contact.receive_mailbox_token);
+            }
+            for invitation in device.issued_invitations() {
+                add_receive_token(&mut receive_tokens, invitation.inviter_receive_token);
+            }
+            local_token.set(receive_tokens);
             if let Some(contact) = device.contacts().first() {
                 recipient_token.set(Some(contact.send_mailbox_token));
-                local_token.set(Some(contact.receive_mailbox_token));
                 selected_contact.set(Some(contact.device_id));
             }
             identity.set(Ok(Some(device)));
@@ -1206,7 +1323,7 @@ fn create_contact_invitation(
     output: &mut Signal<String>,
     status: &mut Signal<Option<String>>,
     mut recipient_token: Signal<Option<[u8; 32]>>,
-    mut local_token: Signal<Option<[u8; 32]>>,
+    mut local_token: Signal<Vec<[u8; 32]>>,
 ) {
     let result = (|| -> Result<String, String> {
         let mut identity_state = identity.write();
@@ -1228,7 +1345,9 @@ fn create_contact_invitation(
             .save_encrypted(identity_path(), autosave_password.read().as_slice())
             .map_err(|error| error.to_string())?;
         recipient_token.set(Some(directions.receive_mailbox_token));
-        local_token.set(Some(directions.send_mailbox_token));
+        let mut receive_tokens = local_token.read().clone();
+        add_receive_token(&mut receive_tokens, directions.send_mailbox_token);
+        local_token.set(receive_tokens);
         Ok(invitation)
     })();
     match result {
@@ -1302,9 +1421,9 @@ fn import_contact_invitation(
     input: &mut Signal<String>,
     status: &mut Signal<Option<String>>,
     mut recipient_token: Signal<Option<[u8; 32]>>,
-    mut local_token: Signal<Option<[u8; 32]>>,
+    mut local_token: Signal<Vec<[u8; 32]>>,
     selected_contact: &mut Signal<Option<uuid::Uuid>>,
-) {
+) -> bool {
     let result = (|| -> Result<ContactRecord, String> {
         let mut identity_state = identity.write();
         let device = identity_state
@@ -1323,15 +1442,21 @@ fn import_contact_invitation(
     match result {
         Ok(contact) => {
             recipient_token.set(Some(contact.send_mailbox_token));
-            local_token.set(Some(contact.receive_mailbox_token));
+            let mut receive_tokens = local_token.read().clone();
+            add_receive_token(&mut receive_tokens, contact.receive_mailbox_token);
+            local_token.set(receive_tokens);
             selected_contact.set(Some(contact.device_id));
             input.set(String::new());
             status.set(Some(format!(
-                "Verified signature and MLS KeyPackage for {}; compare the fingerprint out of band",
+                "Kontakt {} wurde geprüft und importiert",
                 contact.display_name
             )));
+            true
         }
-        Err(error) => status.set(Some(format!("Import rejected: {error}"))),
+        Err(error) => {
+            status.set(Some(format!("Import abgelehnt: {error}")));
+            false
+        }
     }
 }
 
@@ -1339,11 +1464,19 @@ fn select_contact(
     contact: &ContactRecord,
     selected_contact: &mut Signal<Option<uuid::Uuid>>,
     mut recipient_token: Signal<Option<[u8; 32]>>,
-    mut local_token: Signal<Option<[u8; 32]>>,
+    mut local_token: Signal<Vec<[u8; 32]>>,
 ) {
     selected_contact.set(Some(contact.device_id));
     recipient_token.set(Some(contact.send_mailbox_token));
-    local_token.set(Some(contact.receive_mailbox_token));
+    let mut receive_tokens = local_token.read().clone();
+    add_receive_token(&mut receive_tokens, contact.receive_mailbox_token);
+    local_token.set(receive_tokens);
+}
+
+fn add_receive_token(tokens: &mut Vec<[u8; 32]>, token: [u8; 32]) {
+    if !tokens.contains(&token) {
+        tokens.push(token);
+    }
 }
 
 fn verify_contact_fingerprint(

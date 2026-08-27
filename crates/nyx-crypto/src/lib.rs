@@ -470,6 +470,10 @@ impl DeviceIdentity {
             .find(|invitation| invitation.invitation_id == invitation_id)
     }
 
+    pub fn issued_invitations(&self) -> &[IssuedInvitation] {
+        &self.snapshot.issued_invitations
+    }
+
     pub fn verify_invitation(encoded: &str) -> Result<ContactRecord> {
         if encoded.len() > 256 * 1024 {
             bail!("contact invitation exceeds maximum size");
