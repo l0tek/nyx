@@ -29,10 +29,21 @@ not suitable for sensitive or production communication.
 
 ### Other components
 
-- The Dioxus desktop app builds and exposes an interactive local MLS chat demo.
-  Submitted text is encrypted into a real OpenMLS PrivateMessage, processed by
-  the invited peer group, and shown only after successful decryption. The UI
-  reports ciphertext size and initialization/runtime errors.
+- The Dioxus desktop app now starts with local registration or password login.
+  This is an encrypted on-device profile, not a central account: no e-mail,
+  telephone number, directory username, or authentication server is involved.
+- A persistent device identity contains a separate Ed25519 invitation-signing
+  key, stable device UUID, OpenMLS signing material/provider state, a validated
+  RFC 9420 KeyPackage, contacts, and outstanding directional capabilities. It is
+  stored with the authenticated encrypted blob format.
+- The desktop exposes the device fingerprint, signed invitation generation,
+  invitation import, contact selection, explicit out-of-band fingerprint
+  verification, account locking, and the mailbox connection state in a revised UI.
+- Contact invitations are URL-safe Base64/Postcard objects signed over all
+  fields. Import verifies the Ed25519 signature, timestamps, v3 Onion syntax,
+  MLS KeyPackage signature/lifetime/ciphersuite, duplicate device IDs, and size
+  bounds. Each invitation contains separate random 256-bit capabilities for
+  inviter-bound and invitee-bound traffic.
 - `nyx-tor` now bootstraps an Arti client, accepts only syntactically valid v3
   `.onion` endpoints, and implements bounded deposit/fetch/ack requests with a
   60-second timeout. It exposes no Clearnet connection method.
@@ -93,25 +104,28 @@ not suitable for sensitive or production communication.
   clears displayed messages, and suspends inbound processing. The bounded timeout
   can be configured with `NYX_VAULT_LOCK_TIMEOUT_SECS` (30–86,400 seconds).
 - The generic SQLite client-store boundary remains a separate scaffold.
-- The desktop sidebar provides explicit Save and Unlock actions for this MLS
-  state. The password input is zeroized after each operation; a zeroizing
-  in-memory copy remains available while inbound safe-save is active. The location is
-  `nyx-desktop-state.nyx` or `NYX_DESKTOP_STATE_PATH` when configured.
-- The workspace currently has twenty-nine store/crypto/transport/mailbox/protocol/UI unit tests
+- Login unlocks both device identity and MLS state with one local vault password.
+  The input is zeroized after each attempt; a zeroizing in-memory copy remains
+  available while safe-save is active. Identity defaults to
+  `nyx-device-identity.nyx` (`NYX_DEVICE_IDENTITY_PATH`), while MLS state remains
+  `nyx-desktop-state.nyx` (`NYX_DESKTOP_STATE_PATH`).
+- The workspace currently has thirty-three store/crypto/transport/mailbox/protocol/UI unit tests
   covering MLS group/Welcome/message processing, replay rejection, device
   material validation, request serialization,
   oversized-frame rejection, receipt binding, mailbox lifecycle, cross-mailbox
   ACK isolation, Onion endpoint validation, snapshot v1/v2 migration, idempotent
   queue handoff, inbound/outbound safe-save rollback, legacy response-discriminant
-  compatibility, and invalid input rejection.
+  compatibility, persistent identity reload, signed invitation tamper rejection,
+  MLS KeyPackage validation, directional token mapping, and invalid input rejection.
 
 ## Not implemented
 
-- General group lifecycle operations, remote commit handling, removals, and
-  updates are not implemented. Without an explicit Unlock action, the current
-  two-member demo conversation is recreated on app start.
-- Device identity generation, contact invitations, out-of-band verification,
-  and multi-device behavior are not implemented.
+- Remote contact session establishment is not implemented yet: invitation
+  KeyPackages are validated and persisted, but Add/Commit/Welcome transport and
+  the remote-only MLS conversation model still need implementation. Messaging to
+  imported contacts is deliberately disabled instead of reusing the local demo ratchet.
+- General group lifecycle operations, remote commit handling, removals, updates,
+  invitation acceptance responses, and multi-device behavior are not implemented.
 - Initial persistence is still manual; inbound and configured outbound processing
   are automatically safe-saved after Save or Unlock. There is no password
   strength meter, operating-system keyring integration, or recovery mechanism.
@@ -164,13 +178,13 @@ publication or reachability on the public Tor network.
 
 ## Next milestone
 
-The next useful milestone is persistent device identity and a signed contact
-invitation format carrying MLS KeyPackages and directional mailbox capabilities.
+The next useful milestone is invitation acceptance with MLS Add/Commit/Welcome
+delivery, producing a real remote 1:1 conversation from the persisted KeyPackage.
 The manual live-Tor smoke test should later become an isolated, opt-in CI job.
 
 ## Resume notes
 
-Start with persistent device identity and signed contact invitations.
+Start with invitation acceptance and remote MLS Welcome delivery.
 The desktop transport configuration is:
 
 ```bash

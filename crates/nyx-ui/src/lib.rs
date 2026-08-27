@@ -1,5 +1,5 @@
 use dioxus::prelude::*;
-use nyx_crypto::MlsConversation;
+use nyx_crypto::{ContactRecord, DeviceIdentity, MlsConversation};
 use nyx_store::DeliveryQueue;
 use nyx_tor::{OnionEndpoint, TorTransport};
 use std::{
@@ -13,6 +13,15 @@ const CSS: &str = r#"
 * { box-sizing: border-box; }
 body { margin: 0; }
 button, input { font: inherit; }
+.auth-shell { min-height: 100vh; display: grid; place-items: center; padding: 24px; background: radial-gradient(circle at top, #162331, #090d12 55%); }
+.auth-card { width: min(460px, 100%); padding: 34px; border: 1px solid #2a3540; border-radius: 20px; background: #10161df2; box-shadow: 0 24px 70px #0008; }
+.auth-card h1 { margin: 8px 0; font-size: 34px; letter-spacing: .12em; }
+.auth-card p { color: #8c99a6; line-height: 1.55; }
+.field { display: grid; gap: 6px; margin-top: 16px; }
+.field label { color: #8997a5; font-size: 12px; }
+.field input, .field textarea { width: 100%; color: #edf4fa; background: #090f15; border: 1px solid #33404d; border-radius: 10px; padding: 12px; resize: vertical; }
+.primary { width: 100%; margin-top: 18px; border: 0; border-radius: 10px; padding: 12px; background: #8dd39e; color: #07110a; font-weight: 700; cursor: pointer; }
+.primary:disabled { opacity: .45; }
 .app { min-height: 100vh; display: grid; grid-template-columns: 290px 1fr; }
 .sidebar { padding: 26px; border-right: 1px solid #26303a; background: #10161d; }
 .brand { margin: 0; letter-spacing: .08em; }
@@ -22,6 +31,18 @@ button, input { font: inherit; }
 .contact { padding: 14px; border: 1px solid #2a3540; border-radius: 12px; background: #151d26; }
 .contact strong, .contact span { display: block; }
 .contact span { color: #8793a0; font-size: 12px; margin-top: 4px; }
+.contact-list { display: grid; gap: 8px; margin-top: 9px; }
+.contact-item { width: 100%; text-align: left; color: #dce7ef; background: #111922; border: 1px solid #2a3540; border-radius: 10px; padding: 10px; cursor: pointer; }
+.contact-item.active { border-color: #4e8a61; background: #14221a; }
+.contact-item small { display: block; color: #778593; margin-top: 3px; }
+.identity-card { margin: 16px 0; padding: 12px; border: 1px solid #2a3540; border-radius: 10px; background: #0c1218; }
+.fingerprint { margin-top: 5px; color: #7f91a0; font: 9px ui-monospace, monospace; overflow-wrap: anywhere; }
+.mini-button { margin-top: 8px; color: #cdd9e3; background: #1a2530; border: 1px solid #33404d; border-radius: 8px; padding: 7px 9px; cursor: pointer; }
+.contact-tools { padding: 18px 22px; border-bottom: 1px solid #26303a; background: #0b1117; display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.contact-tools textarea { min-height: 76px; color: #dce7ef; background: #080e13; border: 1px solid #303d49; border-radius: 9px; padding: 9px; resize: vertical; font-size: 11px; }
+.tool-actions { display: flex; gap: 8px; }
+.tool-actions button { color: #dbe7ef; background: #18232d; border: 1px solid #354553; border-radius: 8px; padding: 7px 10px; cursor: pointer; }
+.tool-status { color: #8fa0ad; font-size: 11px; margin-top: 6px; }
 .main { padding: 34px; display: flex; justify-content: center; }
 .panel { width: min(850px, 100%); display: grid; grid-template-rows: auto 1fr auto; min-height: calc(100vh - 68px); border: 1px solid #26303a; border-radius: 16px; overflow: hidden; background: #0e141b; }
 .header { padding: 20px 24px; border-bottom: 1px solid #26303a; display: flex; justify-content: space-between; align-items: center; }
@@ -127,22 +148,28 @@ pub fn App() -> Element {
     // Development convenience only: production secrets belong in an encrypted
     // vault or service manager, not a dotenv file.
     let _ = dotenvy::dotenv();
-    let mut conversation = use_signal(|| {
-        MlsConversation::new_1to1(b"local-device".to_vec(), b"peer-device".to_vec())
-            .map_err(|error| error.to_string())
-    });
+    let mut identity = use_signal(|| Ok(None::<DeviceIdentity>));
+    let mut conversation = use_signal(|| Err("Sign in to unlock the MLS state".into()));
     let mut draft = use_signal(String::new);
     let mut messages = use_signal(Vec::<DisplayMessage>::new);
     let mut last_error = use_signal(|| None::<String>);
-    let mut vault_password = use_signal(String::new);
+    let mut auth_name = use_signal(String::new);
+    let mut auth_password = use_signal(String::new);
+    let mut auth_status = use_signal(|| None::<String>);
     let mut vault_status = use_signal(|| None::<String>);
     let autosave_password = use_signal(|| Zeroizing::new(Vec::<u8>::new()));
     let mut vault_last_activity = use_signal(|| None::<Instant>);
+    let mut invitation_output = use_signal(String::new);
+    let mut invitation_input = use_signal(String::new);
+    let mut contact_status = use_signal(|| None::<String>);
+    let mut selected_contact = use_signal(|| None::<uuid::Uuid>);
     let delivery_queue = use_signal(|| {
         DeliveryQueue::open(delivery_queue_path()).map_err(|error| error.to_string())
     });
-    let mailbox_token = token_from_environment("NYX_RECIPIENT_MAILBOX_TOKEN_HEX").ok();
-    let local_mailbox_token = token_from_environment("NYX_LOCAL_MAILBOX_TOKEN_HEX").ok();
+    let recipient_mailbox_token =
+        use_signal(|| token_from_environment("NYX_RECIPIENT_MAILBOX_TOKEN_HEX").ok());
+    let local_mailbox_token =
+        use_signal(|| token_from_environment("NYX_LOCAL_MAILBOX_TOKEN_HEX").ok());
     let transport_status = use_signal(MailboxConnectionStatus::initial);
     use_future(move || {
         run_delivery_worker(
@@ -159,37 +186,120 @@ pub fn App() -> Element {
             autosave_password,
             vault_last_activity,
             conversation,
+            identity,
             messages,
             vault_status,
         )
     });
 
-    let mls_ready = conversation.read().is_ok();
-    let member_count = conversation
+    let account_exists = identity_path().exists();
+    let authenticated = identity
         .read()
         .as_ref()
-        .map(MlsConversation::member_count)
-        .unwrap_or(0);
+        .is_ok_and(|identity| identity.is_some());
+    let mls_ready = conversation.read().is_ok();
     let mailbox_status = transport_status.read().clone();
     let mailbox_last_success = mailbox_status.last_success_label();
+    let (profile_name, profile_fingerprint, contacts) = identity
+        .read()
+        .as_ref()
+        .ok()
+        .and_then(Option::as_ref)
+        .map(|identity| {
+            (
+                identity.display_name().to_owned(),
+                identity.fingerprint(),
+                identity.contacts().to_vec(),
+            )
+        })
+        .unwrap_or_default();
+    let active_contact = contacts
+        .iter()
+        .find(|contact| Some(contact.device_id) == *selected_contact.read())
+        .cloned();
 
     rsx! {
         style { {CSS} }
+        if !authenticated {
+            div { class: "auth-shell",
+                section { class: "auth-card",
+                    div { class: "eyebrow", "Local encrypted identity" }
+                    h1 { "NYX" }
+                    if account_exists {
+                        h2 { "Unlock this device" }
+                        p { "Your profile, device keys, contacts and MLS state stay encrypted on this computer." }
+                    } else {
+                        h2 { "Create a local identity" }
+                        p { "No server account, email address or global username is created." }
+                        div { class: "field",
+                            label { "Display name" }
+                            input {
+                                value: "{auth_name}",
+                                placeholder: "Name shown in signed invitations",
+                                oninput: move |event| auth_name.set(event.value()),
+                            }
+                        }
+                    }
+                    div { class: "field",
+                        label { "Vault password" }
+                        input {
+                            r#type: "password",
+                            value: "{auth_password}",
+                            placeholder: "At least 12 characters",
+                            oninput: move |event| auth_password.set(event.value()),
+                            onkeydown: move |event| {
+                                if event.key() == Key::Enter {
+                                    authenticate_account(account_exists, &mut identity, &mut conversation, &mut auth_name, &mut auth_password, autosave_password, &mut vault_last_activity, recipient_mailbox_token, local_mailbox_token, &mut selected_contact, &mut auth_status);
+                                }
+                            }
+                        }
+                    }
+                    button {
+                        class: "primary",
+                        disabled: auth_password.read().len() < 12 || (!account_exists && auth_name.read().trim().is_empty()),
+                        onclick: move |_| authenticate_account(account_exists, &mut identity, &mut conversation, &mut auth_name, &mut auth_password, autosave_password, &mut vault_last_activity, recipient_mailbox_token, local_mailbox_token, &mut selected_contact, &mut auth_status),
+                        if account_exists { "Unlock" } else { "Create identity" }
+                    }
+                    if let Some(status) = auth_status.read().as_ref() {
+                        div { class: "error", style: "margin-top: 14px", "{status}" }
+                    }
+                }
+            }
+        } else {
         div { class: "app",
             aside { class: "sidebar",
-                div { class: "eyebrow", "Private messaging prototype" }
+                div { class: "eyebrow", "Private messaging" }
                 h1 { class: "brand", "NYX" }
                 div { class: "status",
                     span { class: "dot" }
-                    if mls_ready { "MLS session ready" } else { "MLS initialization failed" }
+                    "Local identity unlocked"
                 }
-                div { class: "eyebrow", "Conversation" }
-                div { class: "contact",
-                    strong { "Peer device" }
-                    span { "1:1 · {member_count} MLS members" }
+                div { class: "identity-card",
+                    strong { "{profile_name}" }
+                    div { class: "fingerprint", "{profile_fingerprint}" }
+                    button {
+                        class: "mini-button",
+                        onclick: move |_| lock_account(&mut conversation, &mut identity, autosave_password, &mut vault_last_activity, &mut messages, &mut vault_status),
+                        "Lock device"
+                    }
                 }
-                p { class: "warning",
-                    if mailbox_token.is_some() { "MLS ciphertext is persisted to the Tor delivery queue." } else { "Set NYX_RECIPIENT_MAILBOX_TOKEN_HEX to enable durable delivery queueing." }
+                div { class: "eyebrow", "Contacts" }
+                div { class: "contact-list",
+                    if contacts.is_empty() {
+                        div { class: "contact", span { "No signed contacts imported" } }
+                    }
+                    for contact in contacts.iter() {
+                        button {
+                            class: if Some(contact.device_id) == *selected_contact.read() { "contact-item active" } else { "contact-item" },
+                            key: "{contact.device_id}",
+                            onclick: {
+                                let contact = contact.clone();
+                                move |_| select_contact(&contact, &mut selected_contact, recipient_mailbox_token, local_mailbox_token)
+                            },
+                            "{contact.display_name}"
+                            small { if contact.verified { "Fingerprint verified" } else { "Verification required" } }
+                        }
+                    }
                 }
                 div { class: "transport",
                     div { class: "eyebrow", "Tor delivery" }
@@ -203,53 +313,68 @@ pub fn App() -> Element {
                         div { class: "transport-endpoint", "{endpoint}" }
                     }
                 }
-                div { class: "vault",
-                    div { class: "eyebrow", "Encrypted MLS state" }
-                    input {
-                        r#type: "password",
-                        value: "{vault_password}",
-                        placeholder: "Vault password",
-                        oninput: move |event| {
-                            vault_password.set(event.value());
-                            touch_vault(&mut vault_last_activity, &autosave_password);
-                        },
-                    }
-                    div { class: "vault-actions",
-                        button {
-                            disabled: !mls_ready || vault_password.read().is_empty(),
-                            onclick: move |_| save_session(&conversation, &mut vault_password, autosave_password, &mut vault_last_activity, &mut vault_status),
-                            "Save"
-                        }
-                        button {
-                            disabled: vault_password.read().is_empty(),
-                            onclick: move |_| load_session(&mut conversation, &mut vault_password, autosave_password, &mut vault_last_activity, &mut messages, &mut last_error, &mut vault_status),
-                            "Unlock"
-                        }
-                        button {
-                            disabled: autosave_password.read().is_empty(),
-                            onclick: move |_| lock_session(&mut conversation, autosave_password, &mut vault_last_activity, &mut messages, &mut vault_status),
-                            "Lock"
-                        }
-                    }
-                    if let Some(status) = vault_status.read().as_ref() {
-                        div { class: "vault-result", "{status}" }
-                    }
-                }
             }
             main { class: "main",
                 section { class: "panel",
                     header { class: "header",
                         div {
-                            h2 { "MLS conversation" }
-                            div { class: "subtle", "X25519 · AES-128-GCM · SHA-256 · Ed25519" }
+                            h2 { if let Some(contact) = active_contact.as_ref() { "{contact.display_name}" } else { "Contact setup" } }
+                            div { class: "subtle", "Persistent Ed25519 identity · OpenMLS KeyPackage" }
                         }
-                        span { class: "badge", "RFC 9420 active" }
+                        span { class: "badge", if mls_ready { "Device ready" } else { "Locked" } }
+                    }
+                    div { class: "contact-tools",
+                        div {
+                            div { class: "eyebrow", "Your signed invitation" }
+                            textarea { readonly: true, value: "{invitation_output}", placeholder: "Generate an invitation to share out of band" }
+                            div { class: "tool-actions",
+                                button {
+                                    onclick: move |_| create_contact_invitation(&mut identity, autosave_password, &mut invitation_output, &mut contact_status, recipient_mailbox_token, local_mailbox_token),
+                                    "Generate"
+                                }
+                            }
+                        }
+                        div {
+                            div { class: "eyebrow", "Import invitation" }
+                            textarea {
+                                value: "{invitation_input}",
+                                placeholder: "Paste a signed Nyx invitation",
+                                oninput: move |event| invitation_input.set(event.value()),
+                            }
+                            div { class: "tool-actions",
+                                button {
+                                    disabled: invitation_input.read().trim().is_empty(),
+                                    onclick: move |_| import_contact_invitation(&mut identity, autosave_password, &mut invitation_input, &mut contact_status, recipient_mailbox_token, local_mailbox_token, &mut selected_contact),
+                                    "Verify & import"
+                                }
+                            }
+                        }
+                        if let Some(status) = contact_status.read().as_ref() {
+                            div { class: "tool-status", style: "grid-column: 1 / -1", "{status}" }
+                        }
                     }
                     div { class: "messages",
-                        if messages.read().is_empty() {
+                        if let Some(contact) = active_contact.as_ref() {
                             div { class: "empty",
-                                h3 { "End-to-end encryption is initialized" }
-                                p { "Every message entered below is converted into a real OpenMLS PrivateMessage and decrypted by the simulated peer group before it appears here." }
+                                h3 { "{contact.display_name}" }
+                                p { "Signed invitation and MLS KeyPackage imported. Compare this fingerprint out of band before establishing a remote MLS session:" }
+                                div { class: "fingerprint", "{contact.identity_fingerprint}" }
+                                p { if contact.verified { "Identity marked as verified." } else { "Remote MLS session establishment is the next protocol step; messaging remains disabled to avoid using the local demo ratchet with a real contact." } }
+                                if !contact.verified {
+                                    button {
+                                        class: "mini-button",
+                                        onclick: {
+                                            let device_id = contact.device_id;
+                                            move |_| verify_contact_fingerprint(&mut identity, device_id, autosave_password, &mut contact_status)
+                                        },
+                                        "I compared this fingerprint"
+                                    }
+                                }
+                            }
+                        } else if messages.read().is_empty() {
+                            div { class: "empty",
+                                h3 { "Create or import a contact invitation" }
+                                p { "Invitations are Ed25519-signed, carry a validated RFC 9420 KeyPackage and use separate mailbox capabilities for each direction." }
                             }
                         }
                         for (index, message) in messages.read().iter().enumerate() {
@@ -269,8 +394,8 @@ pub fn App() -> Element {
                     div { class: "composer",
                         input {
                             value: "{draft}",
-                            placeholder: "Write a message for the MLS peer…",
-                            disabled: !mls_ready,
+                            placeholder: if active_contact.is_some() { "Remote MLS session setup pending" } else { "Select a contact" },
+                            disabled: true,
                             oninput: move |event| {
                                 draft.set(event.value());
                                 touch_vault(&mut vault_last_activity, &autosave_password);
@@ -278,21 +403,22 @@ pub fn App() -> Element {
                             onkeydown: move |event| {
                                 if event.key() == Key::Enter {
                                     touch_vault(&mut vault_last_activity, &autosave_password);
-                                    send_message(&mut conversation, &delivery_queue, &mailbox_token, &mut draft, &mut messages, &mut last_error, &autosave_password);
+                                    send_message(&mut conversation, &delivery_queue, recipient_mailbox_token, &mut draft, &mut messages, &mut last_error, &autosave_password);
                                 }
                             }
                         }
                         button {
-                            disabled: !mls_ready || draft.read().trim().is_empty(),
+                            disabled: true,
                             onclick: move |_| {
                                 touch_vault(&mut vault_last_activity, &autosave_password);
-                                send_message(&mut conversation, &delivery_queue, &mailbox_token, &mut draft, &mut messages, &mut last_error, &autosave_password);
+                                send_message(&mut conversation, &delivery_queue, recipient_mailbox_token, &mut draft, &mut messages, &mut last_error, &autosave_password);
                             },
                             "Encrypt & send"
                         }
                     }
                 }
             }
+        }
         }
     }
 }
@@ -301,6 +427,12 @@ fn state_path() -> PathBuf {
     std::env::var_os("NYX_DESKTOP_STATE_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("nyx-desktop-state.nyx"))
+}
+
+fn identity_path() -> PathBuf {
+    std::env::var_os("NYX_DEVICE_IDENTITY_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nyx-device-identity.nyx"))
 }
 
 fn delivery_queue_path() -> PathBuf {
@@ -324,7 +456,7 @@ fn token_from_environment(name: &str) -> Result<[u8; 32], String> {
 
 async fn run_delivery_worker(
     mut status: Signal<MailboxConnectionStatus>,
-    local_mailbox_token: Option<[u8; 32]>,
+    local_mailbox_token: Signal<Option<[u8; 32]>>,
     mut conversation: Signal<Result<MlsConversation, String>>,
     mut messages: Signal<Vec<DisplayMessage>>,
     mut last_error: Signal<Option<String>>,
@@ -462,7 +594,7 @@ async fn run_delivery_worker(
                 ),
             }
 
-            if let Some(token) = local_mailbox_token {
+            if let Some(token) = *local_mailbox_token.read() {
                 match transport.fetch(&endpoint, token, 32).await {
                     Ok(envelopes) => {
                         let mut receipts = Vec::new();
@@ -564,63 +696,191 @@ fn update_connection_detail(status: &mut Signal<MailboxConnectionStatus>, detail
     status.write().detail = detail;
 }
 
-fn save_session(
-    conversation: &Signal<Result<MlsConversation, String>>,
+#[allow(clippy::too_many_arguments)]
+fn authenticate_account(
+    account_exists: bool,
+    identity: &mut Signal<Result<Option<DeviceIdentity>, String>>,
+    conversation: &mut Signal<Result<MlsConversation, String>>,
+    display_name: &mut Signal<String>,
     password: &mut Signal<String>,
     mut autosave_password: Signal<Zeroizing<Vec<u8>>>,
     last_activity: &mut Signal<Option<Instant>>,
+    mut recipient_token: Signal<Option<[u8; 32]>>,
+    mut local_token: Signal<Option<[u8; 32]>>,
+    selected_contact: &mut Signal<Option<uuid::Uuid>>,
     status: &mut Signal<Option<String>>,
 ) {
-    let path = state_path();
-    let result: Result<(), String> = match conversation.read().as_ref() {
-        Ok(conversation) => conversation
-            .save_encrypted(&path, password.read().as_bytes())
-            .map_err(|error| error.to_string()),
-        Err(error) => Err(error.clone()),
-    };
-    match result {
-        Ok(()) => {
-            autosave_password.set(Zeroizing::new(password.read().as_bytes().to_vec()));
-            last_activity.set(Some(Instant::now()));
-            status.set(Some(format!(
-                "Saved encrypted state to {}; inbound safe-save is active",
-                path.display()
-            )));
+    let password_bytes = Zeroizing::new(password.read().as_bytes().to_vec());
+    let result = (|| -> Result<(DeviceIdentity, MlsConversation), String> {
+        if password_bytes.len() < 12 {
+            return Err("Vault password must contain at least 12 characters".into());
         }
-        Err(error) => status.set(Some(format!("Save failed: {error}"))),
+        let device = if account_exists {
+            DeviceIdentity::load_encrypted(identity_path(), &password_bytes)
+                .map_err(|error| error.to_string())?
+        } else {
+            let device = DeviceIdentity::generate(display_name.read().as_str())
+                .map_err(|error| error.to_string())?;
+            device
+                .save_encrypted(identity_path(), &password_bytes)
+                .map_err(|error| error.to_string())?;
+            device
+        };
+        let conversation = if account_exists && state_path().exists() {
+            MlsConversation::load_encrypted(state_path(), &password_bytes)
+                .map_err(|error| error.to_string())?
+        } else {
+            let conversation = MlsConversation::new_1to1(
+                device.device_id().as_bytes().to_vec(),
+                b"pending-contact-session".to_vec(),
+            )
+            .map_err(|error| error.to_string())?;
+            conversation
+                .save_encrypted(state_path(), &password_bytes)
+                .map_err(|error| error.to_string())?;
+            conversation
+        };
+        Ok((device, conversation))
+    })();
+    match result {
+        Ok((device, restored_conversation)) => {
+            if let Some(contact) = device.contacts().first() {
+                recipient_token.set(Some(contact.send_mailbox_token));
+                local_token.set(Some(contact.receive_mailbox_token));
+                selected_contact.set(Some(contact.device_id));
+            }
+            identity.set(Ok(Some(device)));
+            conversation.set(Ok(restored_conversation));
+            autosave_password.set(Zeroizing::new(password_bytes.to_vec()));
+            last_activity.set(Some(Instant::now()));
+            status.set(None);
+        }
+        Err(error) => status.set(Some(error)),
     }
     password.write().zeroize();
 }
 
-fn load_session(
-    conversation: &mut Signal<Result<MlsConversation, String>>,
-    password: &mut Signal<String>,
-    mut autosave_password: Signal<Zeroizing<Vec<u8>>>,
-    last_activity: &mut Signal<Option<Instant>>,
-    messages: &mut Signal<Vec<DisplayMessage>>,
-    last_error: &mut Signal<Option<String>>,
+fn create_contact_invitation(
+    identity: &mut Signal<Result<Option<DeviceIdentity>, String>>,
+    autosave_password: Signal<Zeroizing<Vec<u8>>>,
+    output: &mut Signal<String>,
+    status: &mut Signal<Option<String>>,
+    mut recipient_token: Signal<Option<[u8; 32]>>,
+    mut local_token: Signal<Option<[u8; 32]>>,
+) {
+    let result = (|| -> Result<String, String> {
+        let onion = std::env::var("NYX_MAILBOX_ONION")
+            .map_err(|_| "NYX_MAILBOX_ONION is not configured".to_owned())?;
+        let mut identity_state = identity.write();
+        let device = identity_state
+            .as_mut()
+            .map_err(|error| error.clone())?
+            .as_mut()
+            .ok_or_else(|| "Device is locked".to_owned())?;
+        let invitation = device
+            .create_invitation(onion)
+            .map_err(|error| error.to_string())?;
+        let directions =
+            DeviceIdentity::verify_invitation(&invitation).map_err(|error| error.to_string())?;
+        device
+            .save_encrypted(identity_path(), autosave_password.read().as_slice())
+            .map_err(|error| error.to_string())?;
+        recipient_token.set(Some(directions.receive_mailbox_token));
+        local_token.set(Some(directions.send_mailbox_token));
+        Ok(invitation)
+    })();
+    match result {
+        Ok(invitation) => {
+            output.set(invitation);
+            status.set(Some(
+                "Signed invitation created; share it over a verified out-of-band channel".into(),
+            ));
+        }
+        Err(error) => status.set(Some(format!("Invitation failed: {error}"))),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn import_contact_invitation(
+    identity: &mut Signal<Result<Option<DeviceIdentity>, String>>,
+    autosave_password: Signal<Zeroizing<Vec<u8>>>,
+    input: &mut Signal<String>,
+    status: &mut Signal<Option<String>>,
+    mut recipient_token: Signal<Option<[u8; 32]>>,
+    mut local_token: Signal<Option<[u8; 32]>>,
+    selected_contact: &mut Signal<Option<uuid::Uuid>>,
+) {
+    let result = (|| -> Result<ContactRecord, String> {
+        let mut identity_state = identity.write();
+        let device = identity_state
+            .as_mut()
+            .map_err(|error| error.clone())?
+            .as_mut()
+            .ok_or_else(|| "Device is locked".to_owned())?;
+        let contact = device
+            .import_invitation(input.read().trim())
+            .map_err(|error| error.to_string())?;
+        device
+            .save_encrypted(identity_path(), autosave_password.read().as_slice())
+            .map_err(|error| error.to_string())?;
+        Ok(contact)
+    })();
+    match result {
+        Ok(contact) => {
+            recipient_token.set(Some(contact.send_mailbox_token));
+            local_token.set(Some(contact.receive_mailbox_token));
+            selected_contact.set(Some(contact.device_id));
+            input.set(String::new());
+            status.set(Some(format!(
+                "Verified signature and MLS KeyPackage for {}; compare the fingerprint out of band",
+                contact.display_name
+            )));
+        }
+        Err(error) => status.set(Some(format!("Import rejected: {error}"))),
+    }
+}
+
+fn select_contact(
+    contact: &ContactRecord,
+    selected_contact: &mut Signal<Option<uuid::Uuid>>,
+    mut recipient_token: Signal<Option<[u8; 32]>>,
+    mut local_token: Signal<Option<[u8; 32]>>,
+) {
+    selected_contact.set(Some(contact.device_id));
+    recipient_token.set(Some(contact.send_mailbox_token));
+    local_token.set(Some(contact.receive_mailbox_token));
+}
+
+fn verify_contact_fingerprint(
+    identity: &mut Signal<Result<Option<DeviceIdentity>, String>>,
+    device_id: uuid::Uuid,
+    autosave_password: Signal<Zeroizing<Vec<u8>>>,
     status: &mut Signal<Option<String>>,
 ) {
-    let path = state_path();
-    let result = MlsConversation::load_encrypted(&path, password.read().as_bytes());
+    let result = (|| -> Result<(), String> {
+        let mut identity_state = identity.write();
+        let device = identity_state
+            .as_mut()
+            .map_err(|error| error.clone())?
+            .as_mut()
+            .ok_or_else(|| "Device is locked".to_owned())?;
+        device
+            .mark_contact_verified(device_id)
+            .map_err(|error| error.to_string())?;
+        device
+            .save_encrypted(identity_path(), autosave_password.read().as_slice())
+            .map_err(|error| error.to_string())
+    })();
     match result {
-        Ok(restored) => {
-            autosave_password.set(Zeroizing::new(password.read().as_bytes().to_vec()));
-            last_activity.set(Some(Instant::now()));
-            conversation.set(Ok(restored));
-            messages.write().clear();
-            last_error.set(None);
-            status.set(Some(format!("Unlocked MLS state from {}", path.display())));
-        }
-        Err(error) => status.set(Some(format!("Unlock failed: {error}"))),
+        Ok(()) => status.set(Some("Contact fingerprint marked as verified".into())),
+        Err(error) => status.set(Some(format!("Verification update failed: {error}"))),
     }
-    password.write().zeroize();
 }
 
 fn send_message(
     conversation: &mut Signal<Result<MlsConversation, String>>,
     delivery_queue: &Signal<Result<DeliveryQueue, String>>,
-    mailbox_token: &Option<[u8; 32]>,
+    mailbox_token: Signal<Option<[u8; 32]>>,
     draft: &mut Signal<String>,
     messages: &mut Signal<Vec<DisplayMessage>>,
     last_error: &mut Signal<Option<String>>,
@@ -632,7 +892,8 @@ fn send_message(
     }
     let result = match conversation.write().as_mut() {
         Ok(conversation) => (|| {
-            let (ciphertext_size, decrypted, queued, warning) = match mailbox_token.as_ref() {
+            let token = *mailbox_token.read();
+            let (ciphertext_size, decrypted, queued, warning) = match token.as_ref() {
                 Some(token) => {
                     let queue_state = delivery_queue.read();
                     let queue = queue_state
@@ -730,8 +991,9 @@ fn touch_vault(
     }
 }
 
-fn lock_session(
+fn lock_account(
     conversation: &mut Signal<Result<MlsConversation, String>>,
+    identity: &mut Signal<Result<Option<DeviceIdentity>, String>>,
     mut autosave_password: Signal<Zeroizing<Vec<u8>>>,
     last_activity: &mut Signal<Option<Instant>>,
     messages: &mut Signal<Vec<DisplayMessage>>,
@@ -742,6 +1004,7 @@ fn lock_session(
     conversation.set(Err(
         "Vault is locked; enter the password and select Unlock".into()
     ));
+    identity.set(Ok(None));
     messages.write().clear();
     status.set(Some(
         "Vault locked; MLS state and autosave password were removed from memory".into(),
@@ -752,6 +1015,7 @@ async fn run_vault_lock_timer(
     autosave_password: Signal<Zeroizing<Vec<u8>>>,
     last_activity: Signal<Option<Instant>>,
     mut conversation: Signal<Result<MlsConversation, String>>,
+    mut identity: Signal<Result<Option<DeviceIdentity>, String>>,
     mut messages: Signal<Vec<DisplayMessage>>,
     mut status: Signal<Option<String>>,
 ) {
@@ -764,8 +1028,9 @@ async fn run_vault_lock_timer(
             .is_some_and(|activity| activity.elapsed() >= timeout);
         if expired && !autosave_password.read().is_empty() {
             let mut activity = last_activity;
-            lock_session(
+            lock_account(
                 &mut conversation,
+                &mut identity,
                 autosave_password,
                 &mut activity,
                 &mut messages,

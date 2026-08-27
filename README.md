@@ -81,13 +81,15 @@ See [`docs/project-status.md`](docs/project-status.md) for implemented features,
 known limitations, and the remaining security work.
 
 The client transport and cryptographic crates intentionally contain explicit
-TODO boundaries. The server-side Arti Onion Service, opaque mailbox storage, and
-headless `nyx-tor` mailbox client are implemented. The desktop app demonstrates a real in-memory
-two-member OpenMLS group, Welcome processing, encryption, decryption, and replay
-protection. The desktop sidebar can save and unlock the full in-memory OpenMLS
-state through the Argon2id/XChaCha20-Poly1305 encrypted store. It writes
+security boundaries. The server-side Arti Onion Service, opaque mailbox storage,
+and headless `nyx-tor` mailbox client are implemented. The desktop app provides
+local encrypted registration/login, a persistent Ed25519 device identity, a
+validated OpenMLS KeyPackage, signed contact invitations, directional mailbox
+capabilities, fingerprint verification, and the existing local two-member MLS
+validation conversation. The vault writes MLS state to
 `nyx-desktop-state.nyx` by default; use `NYX_DESKTOP_STATE_PATH` to override the
-location. When `NYX_RECIPIENT_MAILBOX_TOKEN_HEX` contains a 32-byte token as 64
+location. Device identity defaults to `nyx-device-identity.nyx`; override it with
+`NYX_DEVICE_IDENTITY_PATH`. When `NYX_RECIPIENT_MAILBOX_TOKEN_HEX` contains a 32-byte token as 64
 hexadecimal characters, sent MLS ciphertext is durably queued in
 `nyx-delivery.sqlite3`; override it with `NYX_DELIVERY_QUEUE_PATH`. The desktop
 flushes this queue automatically when `NYX_MAILBOX_ONION` names a validated v3
@@ -105,6 +107,10 @@ ad-hoc cryptography or use the demo for sensitive messaging.
 The desktop sidebar performs a payload-free health request through Tor every ten
 seconds and displays Tor bootstrap, Onion mailbox reachability, round-trip time,
 last successful check, and delivery errors separately.
+
+Imported contacts are not yet message-enabled: the application validates and
+stores their invitation and KeyPackage, but deliberately waits for the next
+milestone's Add/Commit/Welcome exchange before creating a remote MLS session.
 
 ## Security rule
 

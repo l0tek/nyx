@@ -4,14 +4,18 @@
 //! Do not invent a custom ratchet or key-exchange protocol here.
 
 use anyhow::{Context, Result, bail};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
 use openmls::prelude::{
     BasicCredential, Ciphersuite, CredentialWithKey, KeyPackage, KeyPackageBundle, MlsGroup,
     MlsGroupCreateConfig, MlsGroupJoinConfig, MlsMessageBodyIn, MlsMessageIn,
-    ProcessedMessageContent, StagedWelcome, tls_codec::Deserialize,
+    ProcessedMessageContent, StagedWelcome,
+    tls_codec::{Deserialize, Serialize},
 };
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
 use openmls_traits::OpenMlsProvider;
+use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
 use std::{
     collections::HashMap,
@@ -19,13 +23,350 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 pub const NYX_CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
 const MAX_DEVICE_IDENTITY_SIZE: usize = 1024;
 const SNAPSHOT_VERSION: u16 = 3;
 const MAX_INBOUND_RECEIPTS: usize = 4096;
 const MAX_OUTBOUND_JOURNAL: usize = 1024;
+const DEVICE_SNAPSHOT_VERSION: u16 = 1;
+const INVITATION_VERSION: u16 = 1;
+const MAX_DISPLAY_NAME_SIZE: usize = 64;
+const MAX_CONTACTS: usize = 1024;
+const INVITATION_LIFETIME_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+
+#[derive(Clone, Debug, SerdeSerialize, SerdeDeserialize, PartialEq, Eq)]
+pub struct ContactRecord {
+    pub invitation_id: Uuid,
+    pub device_id: Uuid,
+    pub display_name: String,
+    pub identity_public_key: [u8; 32],
+    pub identity_fingerprint: String,
+    pub mls_key_package: Vec<u8>,
+    pub mailbox_onion: String,
+    /// Token used by this device when sending to the contact.
+    pub send_mailbox_token: [u8; 32],
+    /// Token polled by this device for messages sent by the contact.
+    pub receive_mailbox_token: [u8; 32],
+    pub verified: bool,
+}
+
+#[derive(Clone, Debug, SerdeSerialize, SerdeDeserialize)]
+pub struct IssuedInvitation {
+    pub invitation_id: Uuid,
+    pub inviter_receive_token: [u8; 32],
+    pub invitee_receive_token: [u8; 32],
+    pub expires_unix_ms: i64,
+}
+
+#[derive(Clone, Debug, SerdeSerialize, SerdeDeserialize)]
+pub struct ContactInvitationPayload {
+    pub version: u16,
+    pub invitation_id: Uuid,
+    pub inviter_device_id: Uuid,
+    pub inviter_display_name: String,
+    pub inviter_identity_public_key: [u8; 32],
+    pub mls_key_package: Vec<u8>,
+    pub mailbox_onion: String,
+    /// Recipient uses this token to send messages to the inviter.
+    pub inviter_receive_token: [u8; 32],
+    /// Recipient polls this token for messages sent by the inviter.
+    pub invitee_receive_token: [u8; 32],
+    pub created_unix_ms: i64,
+    pub expires_unix_ms: i64,
+}
+
+#[derive(Clone, Debug, SerdeSerialize, SerdeDeserialize)]
+pub struct SignedContactInvitation {
+    pub payload: ContactInvitationPayload,
+    pub signature: Vec<u8>,
+}
+
+#[derive(SerdeSerialize, SerdeDeserialize)]
+struct DeviceIdentitySnapshot {
+    version: u16,
+    device_id: Uuid,
+    display_name: String,
+    identity_secret_key: [u8; 32],
+    identity_public_key: [u8; 32],
+    mls_signature_key: Vec<u8>,
+    mls_storage: HashMap<Vec<u8>, Vec<u8>>,
+    mls_key_package: Vec<u8>,
+    contacts: Vec<ContactRecord>,
+    issued_invitations: Vec<IssuedInvitation>,
+}
+
+pub struct DeviceIdentity {
+    snapshot: DeviceIdentitySnapshot,
+}
+
+impl Drop for DeviceIdentitySnapshot {
+    fn drop(&mut self) {
+        self.identity_secret_key.zeroize();
+        self.mls_signature_key.zeroize();
+        self.mls_key_package.zeroize();
+        for (mut key, mut value) in self.mls_storage.drain() {
+            key.zeroize();
+            value.zeroize();
+        }
+        for contact in &mut self.contacts {
+            contact.send_mailbox_token.zeroize();
+            contact.receive_mailbox_token.zeroize();
+            contact.mls_key_package.zeroize();
+        }
+        for invitation in &mut self.issued_invitations {
+            invitation.inviter_receive_token.zeroize();
+            invitation.invitee_receive_token.zeroize();
+        }
+    }
+}
+
+impl DeviceIdentity {
+    pub fn generate(display_name: impl Into<String>) -> Result<Self> {
+        let display_name = validate_display_name(display_name.into())?;
+        let device_id = Uuid::new_v4();
+        let mls_device = MlsDevice::generate(device_id.as_bytes().to_vec())?;
+        let mls_key_package = mls_device
+            .key_package()?
+            .key_package()
+            .tls_serialize_detached()
+            .map_err(|error| anyhow::anyhow!("serialize device MLS KeyPackage: {error:?}"))?;
+        let mut identity_secret_key = [0_u8; 32];
+        OsRng.fill_bytes(&mut identity_secret_key);
+        let identity_public_key = SigningKey::from_bytes(&identity_secret_key)
+            .verifying_key()
+            .to_bytes();
+        Ok(Self {
+            snapshot: DeviceIdentitySnapshot {
+                version: DEVICE_SNAPSHOT_VERSION,
+                device_id,
+                display_name,
+                identity_secret_key,
+                identity_public_key,
+                mls_signature_key: mls_device.credential.signature_key.as_slice().to_vec(),
+                mls_storage: clone_storage(mls_device.provider())?,
+                mls_key_package,
+                contacts: Vec::new(),
+                issued_invitations: Vec::new(),
+            },
+        })
+    }
+
+    pub fn device_id(&self) -> Uuid {
+        self.snapshot.device_id
+    }
+
+    pub fn display_name(&self) -> &str {
+        &self.snapshot.display_name
+    }
+
+    pub fn fingerprint(&self) -> String {
+        fingerprint(&self.snapshot.identity_public_key)
+    }
+
+    pub fn contacts(&self) -> &[ContactRecord] {
+        &self.snapshot.contacts
+    }
+
+    pub fn create_invitation(&mut self, mailbox_onion: impl Into<String>) -> Result<String> {
+        let mailbox_onion = validate_onion_address(mailbox_onion.into())?;
+        let now = unix_time_ms()?;
+        let mut inviter_receive_token = [0_u8; 32];
+        let mut invitee_receive_token = [0_u8; 32];
+        OsRng.fill_bytes(&mut inviter_receive_token);
+        OsRng.fill_bytes(&mut invitee_receive_token);
+        let payload = ContactInvitationPayload {
+            version: INVITATION_VERSION,
+            invitation_id: Uuid::new_v4(),
+            inviter_device_id: self.snapshot.device_id,
+            inviter_display_name: self.snapshot.display_name.clone(),
+            inviter_identity_public_key: self.snapshot.identity_public_key,
+            mls_key_package: self.snapshot.mls_key_package.clone(),
+            mailbox_onion,
+            inviter_receive_token,
+            invitee_receive_token,
+            created_unix_ms: now,
+            expires_unix_ms: now.saturating_add(INVITATION_LIFETIME_MS),
+        };
+        let encoded_payload = postcard::to_allocvec(&payload).context("serialize invitation")?;
+        let signature = SigningKey::from_bytes(&self.snapshot.identity_secret_key)
+            .sign(&encoded_payload)
+            .to_bytes()
+            .to_vec();
+        let invitation = SignedContactInvitation { payload, signature };
+        self.snapshot.issued_invitations.push(IssuedInvitation {
+            invitation_id: invitation.payload.invitation_id,
+            inviter_receive_token: invitation.payload.inviter_receive_token,
+            invitee_receive_token: invitation.payload.invitee_receive_token,
+            expires_unix_ms: invitation.payload.expires_unix_ms,
+        });
+        Ok(URL_SAFE_NO_PAD
+            .encode(postcard::to_allocvec(&invitation).context("serialize signed invitation")?))
+    }
+
+    pub fn issued_invitation(&self, invitation_id: Uuid) -> Option<&IssuedInvitation> {
+        self.snapshot
+            .issued_invitations
+            .iter()
+            .find(|invitation| invitation.invitation_id == invitation_id)
+    }
+
+    pub fn verify_invitation(encoded: &str) -> Result<ContactRecord> {
+        if encoded.len() > 256 * 1024 {
+            bail!("contact invitation exceeds maximum size");
+        }
+        let bytes = URL_SAFE_NO_PAD
+            .decode(encoded.trim())
+            .context("decode contact invitation")?;
+        let invitation: SignedContactInvitation =
+            postcard::from_bytes(&bytes).context("deserialize contact invitation")?;
+        let payload = &invitation.payload;
+        if payload.version != INVITATION_VERSION {
+            bail!("contact invitation version is unsupported");
+        }
+        validate_display_name(payload.inviter_display_name.clone())?;
+        validate_onion_address(payload.mailbox_onion.clone())?;
+        let now = unix_time_ms()?;
+        if payload.created_unix_ms > now.saturating_add(5 * 60 * 1000)
+            || payload.expires_unix_ms <= now
+            || payload.expires_unix_ms <= payload.created_unix_ms
+        {
+            bail!("contact invitation is expired or has invalid timestamps");
+        }
+        let public_key = VerifyingKey::from_bytes(&payload.inviter_identity_public_key)
+            .context("contact invitation identity key is invalid")?;
+        let signature_bytes: [u8; 64] = invitation
+            .signature
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("contact invitation signature has invalid length"))?;
+        let encoded_payload = postcard::to_allocvec(payload).context("serialize invitation")?;
+        public_key
+            .verify(&encoded_payload, &Signature::from_bytes(&signature_bytes))
+            .context("contact invitation signature verification failed")?;
+        let provider = OpenMlsRustCrypto::default();
+        let key_package =
+            openmls::prelude::KeyPackageIn::tls_deserialize_exact(payload.mls_key_package.clone())
+                .map_err(|error| {
+                    anyhow::anyhow!("deserialize invitation MLS KeyPackage: {error:?}")
+                })?
+                .validate(provider.crypto(), openmls::prelude::ProtocolVersion::Mls10)
+                .map_err(|error| {
+                    anyhow::anyhow!("validate invitation MLS KeyPackage: {error:?}")
+                })?;
+        if key_package.ciphersuite() != NYX_CIPHERSUITE {
+            bail!("contact invitation uses an unsupported MLS ciphersuite");
+        }
+        Ok(ContactRecord {
+            invitation_id: payload.invitation_id,
+            device_id: payload.inviter_device_id,
+            display_name: payload.inviter_display_name.clone(),
+            identity_public_key: payload.inviter_identity_public_key,
+            identity_fingerprint: fingerprint(&payload.inviter_identity_public_key),
+            mls_key_package: payload.mls_key_package.clone(),
+            mailbox_onion: payload.mailbox_onion.clone(),
+            send_mailbox_token: payload.inviter_receive_token,
+            receive_mailbox_token: payload.invitee_receive_token,
+            verified: false,
+        })
+    }
+
+    pub fn import_invitation(&mut self, encoded: &str) -> Result<ContactRecord> {
+        if self.snapshot.contacts.len() >= MAX_CONTACTS {
+            bail!("contact limit reached");
+        }
+        let contact = Self::verify_invitation(encoded)?;
+        if contact.identity_public_key == self.snapshot.identity_public_key {
+            bail!("cannot import an invitation from this device");
+        }
+        if self
+            .snapshot
+            .contacts
+            .iter()
+            .any(|existing| existing.device_id == contact.device_id)
+        {
+            bail!("contact device is already imported");
+        }
+        self.snapshot.contacts.push(contact.clone());
+        Ok(contact)
+    }
+
+    pub fn mark_contact_verified(&mut self, device_id: Uuid) -> Result<()> {
+        let contact = self
+            .snapshot
+            .contacts
+            .iter_mut()
+            .find(|contact| contact.device_id == device_id)
+            .ok_or_else(|| anyhow::anyhow!("contact does not exist"))?;
+        contact.verified = true;
+        Ok(())
+    }
+
+    pub fn save_encrypted(&self, path: impl AsRef<Path>, password: &[u8]) -> Result<()> {
+        let encoded = Zeroizing::new(
+            postcard::to_allocvec(&self.snapshot).context("serialize device identity")?,
+        );
+        nyx_store::EncryptedBlobStore::save(path, password, &encoded)
+            .context("save encrypted device identity")
+    }
+
+    pub fn load_encrypted(path: impl AsRef<Path>, password: &[u8]) -> Result<Self> {
+        let encoded = nyx_store::EncryptedBlobStore::load(path, password)
+            .context("load encrypted device identity")?;
+        let snapshot: DeviceIdentitySnapshot =
+            postcard::from_bytes(&encoded).context("deserialize device identity")?;
+        if snapshot.version != DEVICE_SNAPSHOT_VERSION {
+            bail!("device identity version is unsupported");
+        }
+        validate_display_name(snapshot.display_name.clone())?;
+        let signing_key = SigningKey::from_bytes(&snapshot.identity_secret_key);
+        if signing_key.verifying_key().to_bytes() != snapshot.identity_public_key {
+            bail!("device identity key pair does not match");
+        }
+        let provider = provider_from_storage(snapshot.mls_storage.clone())?;
+        read_signer(&provider, &snapshot.mls_signature_key)?;
+        openmls::prelude::KeyPackageIn::tls_deserialize_exact(snapshot.mls_key_package.clone())
+            .map_err(|error| anyhow::anyhow!("deserialize stored MLS KeyPackage: {error:?}"))?
+            .validate(provider.crypto(), openmls::prelude::ProtocolVersion::Mls10)
+            .map_err(|error| anyhow::anyhow!("validate stored MLS KeyPackage: {error:?}"))?;
+        Ok(Self { snapshot })
+    }
+}
+
+fn validate_display_name(display_name: String) -> Result<String> {
+    let display_name = display_name.trim().to_owned();
+    if display_name.is_empty() || display_name.len() > MAX_DISPLAY_NAME_SIZE {
+        bail!("display name must contain between 1 and 64 bytes");
+    }
+    Ok(display_name)
+}
+
+fn validate_onion_address(address: String) -> Result<String> {
+    let address = address.trim().to_ascii_lowercase();
+    let service_id = address.strip_suffix(".onion").unwrap_or_default();
+    if service_id.len() != 56
+        || !service_id
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || matches!(byte, b'2'..=b'7'))
+    {
+        bail!("contact invitation requires a valid v3 Onion address");
+    }
+    Ok(address)
+}
+
+fn fingerprint(public_key: &[u8; 32]) -> String {
+    let digest = blake3::hash(public_key);
+    digest
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .chunks(4)
+        .map(|chunk| chunk.concat())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct LocalSecret(pub Vec<u8>);
@@ -856,5 +1197,78 @@ mod tests {
             .create_outbound_and_save(b"retry outbound", [5; 32], valid_path, b"vault password")
             .unwrap();
         assert_eq!(decrypted, b"retry outbound");
+    }
+
+    #[test]
+    fn persistent_device_identity_round_trips() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("identity.nyx");
+        let identity = DeviceIdentity::generate("Alice").unwrap();
+        let device_id = identity.device_id();
+        let fingerprint = identity.fingerprint();
+        identity
+            .save_encrypted(&path, b"strong local password")
+            .unwrap();
+
+        let restored = DeviceIdentity::load_encrypted(&path, b"strong local password").unwrap();
+        assert_eq!(restored.device_id(), device_id);
+        assert_eq!(restored.display_name(), "Alice");
+        assert_eq!(restored.fingerprint(), fingerprint);
+        assert!(DeviceIdentity::load_encrypted(&path, b"wrong password").is_err());
+    }
+
+    #[test]
+    fn signed_contact_invitation_verifies_key_package_and_directions() {
+        let mut alice = DeviceIdentity::generate("Alice").unwrap();
+        let invitation = alice
+            .create_invitation("25njqamcweflpvkl73j4szahhihoc4xt3ktcgjnpaingr5yhkenl5sid.onion")
+            .unwrap();
+        let encoded = URL_SAFE_NO_PAD.decode(&invitation).unwrap();
+        let signed: SignedContactInvitation = postcard::from_bytes(&encoded).unwrap();
+        let contact = DeviceIdentity::verify_invitation(&invitation).unwrap();
+        assert_eq!(contact.device_id, alice.device_id());
+        assert_eq!(contact.display_name, "Alice");
+        assert_eq!(
+            contact.send_mailbox_token,
+            signed.payload.inviter_receive_token
+        );
+        assert_eq!(
+            contact.receive_mailbox_token,
+            signed.payload.invitee_receive_token
+        );
+        assert!(!contact.verified);
+    }
+
+    #[test]
+    fn modified_contact_invitation_is_rejected() {
+        let mut alice = DeviceIdentity::generate("Alice").unwrap();
+        let invitation = alice
+            .create_invitation("25njqamcweflpvkl73j4szahhihoc4xt3ktcgjnpaingr5yhkenl5sid.onion")
+            .unwrap();
+        let encoded = URL_SAFE_NO_PAD.decode(&invitation).unwrap();
+        let mut signed: SignedContactInvitation = postcard::from_bytes(&encoded).unwrap();
+        signed.payload.inviter_display_name = "Mallory".into();
+        let tampered = URL_SAFE_NO_PAD.encode(postcard::to_allocvec(&signed).unwrap());
+        assert!(DeviceIdentity::verify_invitation(&tampered).is_err());
+    }
+
+    #[test]
+    fn imported_contact_and_verification_are_persistent() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("bob-identity.nyx");
+        let mut alice = DeviceIdentity::generate("Alice").unwrap();
+        let invitation = alice
+            .create_invitation("25njqamcweflpvkl73j4szahhihoc4xt3ktcgjnpaingr5yhkenl5sid.onion")
+            .unwrap();
+        let mut bob = DeviceIdentity::generate("Bob").unwrap();
+        let contact = bob.import_invitation(&invitation).unwrap();
+        assert!(bob.import_invitation(&invitation).is_err());
+        bob.mark_contact_verified(contact.device_id).unwrap();
+        bob.save_encrypted(&path, b"strong local password").unwrap();
+
+        let restored = DeviceIdentity::load_encrypted(&path, b"strong local password").unwrap();
+        assert_eq!(restored.contacts().len(), 1);
+        assert!(restored.contacts()[0].verified);
+        assert_eq!(restored.contacts()[0].device_id, alice.device_id());
     }
 }
