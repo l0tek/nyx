@@ -12,3 +12,4 @@ nyx-store = { path = "../nyx-store" }
 nyx-tor = { path = "../nyx-tor" }
 tokio.workspace = true
 zeroize.workspace = true
+dotenvy.workspace = true

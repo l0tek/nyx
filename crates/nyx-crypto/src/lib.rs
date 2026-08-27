@@ -13,12 +13,17 @@ use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
 use openmls_traits::OpenMlsProvider;
 use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::HashMap,
+    path::Path,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 pub const NYX_CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
 const MAX_DEVICE_IDENTITY_SIZE: usize = 1024;
-const SNAPSHOT_VERSION: u16 = 1;
+const SNAPSHOT_VERSION: u16 = 2;
+const MAX_INBOUND_RECEIPTS: usize = 4096;
 
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct LocalSecret(pub Vec<u8>);
@@ -43,6 +48,7 @@ pub struct MlsConversation {
     bob: MlsDevice,
     alice_group: MlsGroup,
     bob_group: MlsGroup,
+    inbound_receipts: Vec<InboundReceipt>,
 }
 
 #[derive(SerdeSerialize, SerdeDeserialize)]
@@ -53,6 +59,45 @@ struct ConversationSnapshot {
     bob_signature_key: Vec<u8>,
     alice_storage: HashMap<Vec<u8>, Vec<u8>>,
     bob_storage: HashMap<Vec<u8>, Vec<u8>>,
+    inbound_receipts: Vec<InboundReceipt>,
+}
+
+#[derive(SerdeSerialize, SerdeDeserialize)]
+struct LegacyConversationSnapshot {
+    version: u16,
+    group_id: Vec<u8>,
+    alice_signature_key: Vec<u8>,
+    bob_signature_key: Vec<u8>,
+    alice_storage: HashMap<Vec<u8>, Vec<u8>>,
+    bob_storage: HashMap<Vec<u8>, Vec<u8>>,
+}
+
+#[derive(Clone, SerdeSerialize, SerdeDeserialize, Zeroize)]
+struct InboundReceipt {
+    receipt: [u8; 32],
+    expires_unix_ms: i64,
+}
+
+impl Drop for MlsConversation {
+    fn drop(&mut self) {
+        self.inbound_receipts.zeroize();
+    }
+}
+
+impl Drop for LegacyConversationSnapshot {
+    fn drop(&mut self) {
+        self.group_id.zeroize();
+        self.alice_signature_key.zeroize();
+        self.bob_signature_key.zeroize();
+        for (mut key, mut value) in self.alice_storage.drain() {
+            key.zeroize();
+            value.zeroize();
+        }
+        for (mut key, mut value) in self.bob_storage.drain() {
+            key.zeroize();
+            value.zeroize();
+        }
+    }
 }
 
 impl Drop for ConversationSnapshot {
@@ -68,6 +113,7 @@ impl Drop for ConversationSnapshot {
             key.zeroize();
             value.zeroize();
         }
+        self.inbound_receipts.zeroize();
     }
 }
 
@@ -177,6 +223,7 @@ impl MlsConversation {
             bob,
             alice_group,
             bob_group,
+            inbound_receipts: Vec::new(),
         })
     }
 
@@ -245,17 +292,76 @@ impl MlsConversation {
         self.alice_group.members().count()
     }
 
+    pub fn has_inbound_receipt(&self, receipt: &[u8; 32]) -> bool {
+        self.inbound_receipts()
+            .iter()
+            .any(|entry| &entry.receipt == receipt)
+    }
+
+    /// Advances the local MLS ratchet, journals the mailbox receipt, and
+    /// atomically persists both in one encrypted snapshot. If persistence
+    /// fails, the pre-message ratchet state is restored before returning.
+    pub fn process_inbound_and_save(
+        &mut self,
+        ciphertext: &[u8],
+        receipt: [u8; 32],
+        expires_unix_ms: i64,
+        path: impl AsRef<Path>,
+        password: &[u8],
+    ) -> Result<Vec<u8>> {
+        if self.has_inbound_receipt(&receipt) {
+            bail!("inbound mailbox receipt was already processed");
+        }
+        let before = self.snapshot()?;
+        let plaintext = self.decrypt_for_alice(ciphertext)?;
+        let now = unix_time_ms()?;
+        let mut snapshot = self.snapshot()?;
+        snapshot
+            .inbound_receipts
+            .retain(|entry| entry.expires_unix_ms > now);
+        if snapshot.inbound_receipts.len() >= MAX_INBOUND_RECEIPTS {
+            *self = Self::from_snapshot(before)?;
+            bail!("inbound receipt journal is full");
+        }
+        snapshot.inbound_receipts.push(InboundReceipt {
+            receipt,
+            expires_unix_ms,
+        });
+        if let Err(error) = Self::save_snapshot(&snapshot, path, password) {
+            *self = Self::from_snapshot(before)
+                .context("restore MLS state after failed inbound safe-save")?;
+            return Err(error);
+        }
+        // Reloading the just-persisted snapshot also installs the pruned and
+        // newly journaled receipt set in the live conversation.
+        *self = Self::from_snapshot(snapshot)?;
+        Ok(plaintext)
+    }
+
     pub fn save_encrypted(&self, path: impl AsRef<Path>, password: &[u8]) -> Result<()> {
-        let snapshot = ConversationSnapshot {
+        let snapshot = self.snapshot()?;
+        Self::save_snapshot(&snapshot, path, password)
+    }
+
+    fn snapshot(&self) -> Result<ConversationSnapshot> {
+        Ok(ConversationSnapshot {
             version: SNAPSHOT_VERSION,
             group_id: self.alice_group.group_id().as_slice().to_vec(),
             alice_signature_key: self.alice.credential.signature_key.as_slice().to_vec(),
             bob_signature_key: self.bob.credential.signature_key.as_slice().to_vec(),
             alice_storage: clone_storage(self.alice.provider())?,
             bob_storage: clone_storage(self.bob.provider())?,
-        };
+            inbound_receipts: self.inbound_receipts().to_vec(),
+        })
+    }
+
+    fn save_snapshot(
+        snapshot: &ConversationSnapshot,
+        path: impl AsRef<Path>,
+        password: &[u8],
+    ) -> Result<()> {
         let encoded = zeroize::Zeroizing::new(
-            postcard::to_allocvec(&snapshot).context("serialize MLS snapshot")?,
+            postcard::to_allocvec(snapshot).context("serialize MLS snapshot")?,
         );
         nyx_store::EncryptedBlobStore::save(path, password, &encoded)
             .context("save encrypted MLS snapshot")
@@ -264,11 +370,29 @@ impl MlsConversation {
     pub fn load_encrypted(path: impl AsRef<Path>, password: &[u8]) -> Result<Self> {
         let encoded = nyx_store::EncryptedBlobStore::load(path, password)
             .context("load encrypted MLS snapshot")?;
-        let mut snapshot: ConversationSnapshot =
-            postcard::from_bytes(&encoded).context("deserialize MLS snapshot")?;
-        if snapshot.version != SNAPSHOT_VERSION {
-            bail!("MLS snapshot version is unsupported");
-        }
+        let snapshot = match postcard::from_bytes::<ConversationSnapshot>(&encoded) {
+            Ok(snapshot) if snapshot.version == SNAPSHOT_VERSION => snapshot,
+            _ => {
+                let mut legacy: LegacyConversationSnapshot =
+                    postcard::from_bytes(&encoded).context("deserialize MLS snapshot")?;
+                if legacy.version != 1 {
+                    bail!("MLS snapshot version is unsupported");
+                }
+                ConversationSnapshot {
+                    version: SNAPSHOT_VERSION,
+                    group_id: std::mem::take(&mut legacy.group_id),
+                    alice_signature_key: std::mem::take(&mut legacy.alice_signature_key),
+                    bob_signature_key: std::mem::take(&mut legacy.bob_signature_key),
+                    alice_storage: std::mem::take(&mut legacy.alice_storage),
+                    bob_storage: std::mem::take(&mut legacy.bob_storage),
+                    inbound_receipts: Vec::new(),
+                }
+            }
+        };
+        Self::from_snapshot(snapshot)
+    }
+
+    fn from_snapshot(mut snapshot: ConversationSnapshot) -> Result<Self> {
         let alice_provider = provider_from_storage(std::mem::take(&mut snapshot.alice_storage))?;
         let bob_provider = provider_from_storage(std::mem::take(&mut snapshot.bob_storage))?;
         let group_id = openmls::prelude::GroupId::from_slice(&snapshot.group_id);
@@ -314,7 +438,12 @@ impl MlsConversation {
             },
             alice_group,
             bob_group,
+            inbound_receipts: std::mem::take(&mut snapshot.inbound_receipts),
         })
+    }
+
+    fn inbound_receipts(&self) -> &[InboundReceipt] {
+        &self.inbound_receipts
     }
 }
 
@@ -344,6 +473,11 @@ fn read_signer(provider: &OpenMlsRustCrypto, public_key: &[u8]) -> Result<Signat
         NYX_CIPHERSUITE.signature_algorithm(),
     )
     .ok_or_else(|| anyhow::anyhow!("MLS signature key is absent from snapshot"))
+}
+
+fn unix_time_ms() -> Result<i64> {
+    let value = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+    i64::try_from(value).context("system time exceeds receipt timestamp range")
 }
 
 #[cfg(test)]
@@ -426,5 +560,92 @@ mod tests {
             b"after restore"
         );
         assert!(MlsConversation::load_encrypted(&path, b"wrong password").is_err());
+    }
+
+    #[test]
+    fn inbound_receipt_and_ratchet_are_saved_together() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.nyx");
+        let mut conversation =
+            MlsConversation::new_1to1(b"alice".to_vec(), b"bob".to_vec()).unwrap();
+        let ciphertext = conversation.encrypt_from_bob(b"durable inbound").unwrap();
+        let receipt = [42; 32];
+
+        let plaintext = conversation
+            .process_inbound_and_save(&ciphertext, receipt, i64::MAX, &path, b"vault password")
+            .unwrap();
+        assert_eq!(plaintext, b"durable inbound");
+        assert!(conversation.has_inbound_receipt(&receipt));
+
+        let restored = MlsConversation::load_encrypted(&path, b"vault password").unwrap();
+        assert!(restored.has_inbound_receipt(&receipt));
+    }
+
+    #[test]
+    fn failed_inbound_safe_save_restores_ratchet() {
+        let directory = tempfile::tempdir().unwrap();
+        let valid_path = directory.path().join("state.nyx");
+        let invalid_path = directory.path();
+        let mut conversation =
+            MlsConversation::new_1to1(b"alice".to_vec(), b"bob".to_vec()).unwrap();
+        let ciphertext = conversation
+            .encrypt_from_bob(b"retry after failure")
+            .unwrap();
+
+        assert!(
+            conversation
+                .process_inbound_and_save(
+                    &ciphertext,
+                    [7; 32],
+                    i64::MAX,
+                    invalid_path,
+                    b"vault password",
+                )
+                .is_err()
+        );
+        assert!(!conversation.has_inbound_receipt(&[7; 32]));
+        assert_eq!(
+            conversation
+                .process_inbound_and_save(
+                    &ciphertext,
+                    [7; 32],
+                    i64::MAX,
+                    valid_path,
+                    b"vault password",
+                )
+                .unwrap(),
+            b"retry after failure"
+        );
+    }
+
+    #[test]
+    fn loads_version_one_snapshot_without_receipt_journal() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("legacy.nyx");
+        let conversation = MlsConversation::new_1to1(b"alice".to_vec(), b"bob".to_vec()).unwrap();
+        let legacy = LegacyConversationSnapshot {
+            version: 1,
+            group_id: conversation.alice_group.group_id().as_slice().to_vec(),
+            alice_signature_key: conversation
+                .alice
+                .credential
+                .signature_key
+                .as_slice()
+                .to_vec(),
+            bob_signature_key: conversation
+                .bob
+                .credential
+                .signature_key
+                .as_slice()
+                .to_vec(),
+            alice_storage: clone_storage(conversation.alice.provider()).unwrap(),
+            bob_storage: clone_storage(conversation.bob.provider()).unwrap(),
+        };
+        let encoded = zeroize::Zeroizing::new(postcard::to_allocvec(&legacy).unwrap());
+        nyx_store::EncryptedBlobStore::save(&path, b"vault password", &encoded).unwrap();
+
+        let restored = MlsConversation::load_encrypted(&path, b"vault password").unwrap();
+        assert_eq!(restored.member_count(), 2);
+        assert!(!restored.has_inbound_receipt(&[1; 32]));
     }
 }

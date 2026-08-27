@@ -47,6 +47,12 @@ For the desktop UI with Dioxus CLI 0.7.x, run from `apps/desktop`:
 dx serve --desktop
 ```
 
+For local development, copy `.env.example` to the workspace-root `.env` and
+replace its placeholders. The desktop app and mailbox server load the nearest
+`.env` automatically without overriding variables already exported by the
+calling process. `.env` is ignored by Git and must not be used as production
+secret storage.
+
 Run the mailbox Onion Service from the workspace root:
 
 ```bash
@@ -87,7 +93,9 @@ hexadecimal characters, sent MLS ciphertext is durably queued in
 flushes this queue automatically when `NYX_MAILBOX_ONION` names a validated v3
 Onion endpoint (`NYX_MAILBOX_PORT` defaults to `443`). Configure
 `NYX_LOCAL_MAILBOX_TOKEN_HEX` to poll, MLS-decrypt, and acknowledge inbound
-messages. Saving is still manual. Do not replace the crypto boundary with
+messages. After Save or Unlock, inbound ratchet advancement and mailbox receipts
+are atomically persisted before acknowledgement; repeats after an ACK failure
+are safely recognized. Initial and outbound saving remain manual. Do not replace the crypto boundary with
 ad-hoc cryptography or use the demo for sensitive messaging.
 
 ## Security rule

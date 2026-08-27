@@ -3,7 +3,7 @@ use nyx_crypto::MlsConversation;
 use nyx_store::DeliveryQueue;
 use nyx_tor::{OnionEndpoint, TorTransport};
 use std::{path::PathBuf, time::Duration};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 const CSS: &str = r#"
 :root { font-family: Inter, system-ui, sans-serif; background: #090d12; color: #e6edf3; }
@@ -59,6 +59,9 @@ struct DisplayMessage {
 
 #[component]
 pub fn App() -> Element {
+    // Development convenience only: production secrets belong in an encrypted
+    // vault or service manager, not a dotenv file.
+    let _ = dotenvy::dotenv();
     let mut conversation = use_signal(|| {
         MlsConversation::new_1to1(b"local-device".to_vec(), b"peer-device".to_vec())
             .map_err(|error| error.to_string())
@@ -68,6 +71,7 @@ pub fn App() -> Element {
     let mut last_error = use_signal(|| None::<String>);
     let mut vault_password = use_signal(String::new);
     let mut vault_status = use_signal(|| None::<String>);
+    let autosave_password = use_signal(|| Zeroizing::new(Vec::<u8>::new()));
     let delivery_queue = use_signal(|| {
         DeliveryQueue::open(delivery_queue_path()).map_err(|error| error.to_string())
     });
@@ -82,6 +86,7 @@ pub fn App() -> Element {
             conversation,
             messages,
             last_error,
+            autosave_password,
         )
     });
 
@@ -125,12 +130,12 @@ pub fn App() -> Element {
                     div { class: "vault-actions",
                         button {
                             disabled: !mls_ready || vault_password.read().is_empty(),
-                            onclick: move |_| save_session(&conversation, &mut vault_password, &mut vault_status),
+                            onclick: move |_| save_session(&conversation, &mut vault_password, autosave_password, &mut vault_status),
                             "Save"
                         }
                         button {
                             disabled: vault_password.read().is_empty(),
-                            onclick: move |_| load_session(&mut conversation, &mut vault_password, &mut messages, &mut last_error, &mut vault_status),
+                            onclick: move |_| load_session(&mut conversation, &mut vault_password, autosave_password, &mut messages, &mut last_error, &mut vault_status),
                             "Unlock"
                         }
                     }
@@ -224,6 +229,7 @@ async fn run_delivery_worker(
     mut conversation: Signal<Result<MlsConversation, String>>,
     mut messages: Signal<Vec<DisplayMessage>>,
     mut last_error: Signal<Option<String>>,
+    autosave_password: Signal<Zeroizing<Vec<u8>>>,
 ) {
     let host = match std::env::var("NYX_MAILBOX_ONION") {
         Ok(host) => host,
@@ -281,9 +287,30 @@ async fn run_delivery_worker(
                     Ok(envelopes) => {
                         let mut receipts = Vec::new();
                         for stored in envelopes {
+                            let already_processed =
+                                conversation.read().as_ref().is_ok_and(|conversation| {
+                                    conversation.has_inbound_receipt(&stored.receipt)
+                                });
+                            if already_processed {
+                                receipts.push(stored.receipt);
+                                continue;
+                            }
+                            if autosave_password.read().is_empty() {
+                                last_error.set(Some(
+                                    "Unlock or save the encrypted MLS vault before receiving messages"
+                                        .into(),
+                                ));
+                                break;
+                            }
                             let decrypted = match conversation.write().as_mut() {
                                 Ok(conversation) => conversation
-                                    .decrypt_for_alice(&stored.envelope.ciphertext)
+                                    .process_inbound_and_save(
+                                        &stored.envelope.ciphertext,
+                                        stored.receipt,
+                                        stored.expires_unix_ms,
+                                        state_path(),
+                                        autosave_password.read().as_slice(),
+                                    )
                                     .map_err(|error| error.to_string()),
                                 Err(error) => Err(error.clone()),
                             };
@@ -328,6 +355,7 @@ async fn run_delivery_worker(
 fn save_session(
     conversation: &Signal<Result<MlsConversation, String>>,
     password: &mut Signal<String>,
+    mut autosave_password: Signal<Zeroizing<Vec<u8>>>,
     status: &mut Signal<Option<String>>,
 ) {
     let path = state_path();
@@ -337,25 +365,32 @@ fn save_session(
             .map_err(|error| error.to_string()),
         Err(error) => Err(error.clone()),
     };
-    password.write().zeroize();
     match result {
-        Ok(()) => status.set(Some(format!("Saved encrypted state to {}", path.display()))),
+        Ok(()) => {
+            autosave_password.set(Zeroizing::new(password.read().as_bytes().to_vec()));
+            status.set(Some(format!(
+                "Saved encrypted state to {}; inbound safe-save is active",
+                path.display()
+            )));
+        }
         Err(error) => status.set(Some(format!("Save failed: {error}"))),
     }
+    password.write().zeroize();
 }
 
 fn load_session(
     conversation: &mut Signal<Result<MlsConversation, String>>,
     password: &mut Signal<String>,
+    mut autosave_password: Signal<Zeroizing<Vec<u8>>>,
     messages: &mut Signal<Vec<DisplayMessage>>,
     last_error: &mut Signal<Option<String>>,
     status: &mut Signal<Option<String>>,
 ) {
     let path = state_path();
     let result = MlsConversation::load_encrypted(&path, password.read().as_bytes());
-    password.write().zeroize();
     match result {
         Ok(restored) => {
+            autosave_password.set(Zeroizing::new(password.read().as_bytes().to_vec()));
             conversation.set(Ok(restored));
             messages.write().clear();
             last_error.set(None);
@@ -363,6 +398,7 @@ fn load_session(
         }
         Err(error) => status.set(Some(format!("Unlock failed: {error}"))),
     }
+    password.write().zeroize();
 }
 
 fn send_message(

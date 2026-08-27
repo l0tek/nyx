@@ -16,6 +16,9 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Loads the nearest .env for local development. Existing process
+    // environment variables retain precedence.
+    let _ = dotenvy::dotenv();
     tracing_subscriber::fmt()
         .with_target(false)
         .with_env_filter(

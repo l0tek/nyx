@@ -18,3 +18,4 @@ tor-cell.workspace = true
 tor-proto.workspace = true
 safelog.workspace = true
 nyx-protocol = { path = "../../crates/nyx-protocol" }
+dotenvy.workspace = true

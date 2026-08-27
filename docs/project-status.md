@@ -70,27 +70,33 @@ not suitable for sensitive or production communication.
 - With `NYX_LOCAL_MAILBOX_TOKEN_HEX`, the worker also fetches inbound envelopes,
   processes Bob-to-Alice OpenMLS application messages, displays valid UTF-8
   text, and acknowledges only MLS messages that were processed successfully.
+- Inbound MLS processing journals each mailbox receipt inside the same encrypted
+  snapshot as the advanced OpenMLS ratchet. The snapshot is atomically replaced
+  before acknowledgement; failed saves restore the pre-message ratchet, and
+  already-journaled receipts are acknowledged again after an ACK failure or restart.
+- Saving or unlocking a vault activates inbound automatic safe-save. The retained
+  in-memory password is zeroized when replaced or dropped; inbound processing is
+  suspended while the vault is locked.
 - The generic SQLite client-store boundary remains a separate scaffold.
 - The desktop sidebar provides explicit Save and Unlock actions for this MLS
-  state. The vault password is zeroized after each operation. The location is
+  state. The password input is zeroized after each operation; a zeroizing
+  in-memory copy remains available while inbound safe-save is active. The location is
   `nyx-desktop-state.nyx` or `NYX_DESKTOP_STATE_PATH` when configured.
-- The workspace currently has eighteen store/crypto/transport/mailbox/protocol unit tests
+- The workspace currently has twenty-one store/crypto/transport/mailbox/protocol unit tests
   covering MLS group/Welcome/message processing, replay rejection, device
   material validation, request serialization,
   oversized-frame rejection, receipt binding, mailbox lifecycle, cross-mailbox
-  ACK isolation, Onion endpoint validation, and invalid input rejection.
+  ACK isolation, Onion endpoint validation, snapshot v1 migration, and invalid input rejection.
 
 ## Not implemented
 
-- Inbound receipt state is not yet journaled atomically with the MLS ratchet. A
-  crash or failed ACK after successful decryption can cause a replayed envelope
-  to remain on the mailbox until explicit recovery logic is implemented.
 - General group lifecycle operations, remote commit handling, removals, and
   updates are not implemented. Without an explicit Unlock action, the current
   two-member demo conversation is recreated on app start.
 - Device identity generation, contact invitations, out-of-band verification,
   and multi-device behavior are not implemented.
-- Persistence is manual; there is no automatic save, locking timer, password
+- Initial persistence and outbound ratchet persistence are still manual; inbound
+  processing is automatically safe-saved after Save or Unlock. There is no locking timer, password
   strength meter, operating-system keyring integration, or recovery mechanism.
   Displayed UI history is not part of the MLS snapshot.
 - The generic client SQLite `kv` store remains unencrypted and must not hold
@@ -141,15 +147,14 @@ publication or reachability on the public Tor network.
 
 ## Next milestone
 
-The next useful milestone is an inbound receipt journal coordinated with
-automatic encrypted MLS safe-save, so a crash between ratchet advancement and
-mailbox acknowledgement can recover deterministically. Lock timeout behavior
-should follow. The manual live-Tor smoke test should later become an isolated,
-opt-in CI job.
+The next useful milestone is lock-timeout behavior that zeroizes the retained
+vault password and suspends inbound processing, followed by coordinated safe-save
+for outbound ratchet advancement and queue insertion. The manual live-Tor smoke
+test should later become an isolated, opt-in CI job.
 
 ## Resume notes
 
-Start with the inbound receipt journal and automatic encrypted MLS safe-save.
+Start with vault lock-timeout behavior and outbound safe-save coordination.
 The desktop transport configuration is:
 
 ```bash
