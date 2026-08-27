@@ -95,7 +95,9 @@ Onion endpoint (`NYX_MAILBOX_PORT` defaults to `443`). Configure
 `NYX_LOCAL_MAILBOX_TOKEN_HEX` to poll, MLS-decrypt, and acknowledge inbound
 messages. After Save or Unlock, inbound ratchet advancement and mailbox receipts
 are atomically persisted before acknowledgement; repeats after an ACK failure
-are safely recognized. Initial and outbound saving remain manual. Do not replace the crypto boundary with
+are safely recognized. The vault locks after five minutes of inactivity by
+default (`NYX_VAULT_LOCK_TIMEOUT_SECS`) and can also be locked explicitly.
+Initial and outbound saving remain manual. Do not replace the crypto boundary with
 ad-hoc cryptography or use the demo for sensitive messaging.
 
 ## Security rule

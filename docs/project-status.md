@@ -77,12 +77,16 @@ not suitable for sensitive or production communication.
 - Saving or unlocking a vault activates inbound automatic safe-save. The retained
   in-memory password is zeroized when replaced or dropped; inbound processing is
   suspended while the vault is locked.
+- The desktop vault locks explicitly or after five minutes of user inactivity by
+  default. Locking zeroizes the retained password, drops the live MLS conversation,
+  clears displayed messages, and suspends inbound processing. The bounded timeout
+  can be configured with `NYX_VAULT_LOCK_TIMEOUT_SECS` (30–86,400 seconds).
 - The generic SQLite client-store boundary remains a separate scaffold.
 - The desktop sidebar provides explicit Save and Unlock actions for this MLS
   state. The password input is zeroized after each operation; a zeroizing
   in-memory copy remains available while inbound safe-save is active. The location is
   `nyx-desktop-state.nyx` or `NYX_DESKTOP_STATE_PATH` when configured.
-- The workspace currently has twenty-one store/crypto/transport/mailbox/protocol unit tests
+- The workspace currently has twenty-two store/crypto/transport/mailbox/protocol/UI unit tests
   covering MLS group/Welcome/message processing, replay rejection, device
   material validation, request serialization,
   oversized-frame rejection, receipt binding, mailbox lifecycle, cross-mailbox
@@ -96,7 +100,7 @@ not suitable for sensitive or production communication.
 - Device identity generation, contact invitations, out-of-band verification,
   and multi-device behavior are not implemented.
 - Initial persistence and outbound ratchet persistence are still manual; inbound
-  processing is automatically safe-saved after Save or Unlock. There is no locking timer, password
+  processing is automatically safe-saved after Save or Unlock. There is no password
   strength meter, operating-system keyring integration, or recovery mechanism.
   Displayed UI history is not part of the MLS snapshot.
 - The generic client SQLite `kv` store remains unencrypted and must not hold
@@ -147,14 +151,13 @@ publication or reachability on the public Tor network.
 
 ## Next milestone
 
-The next useful milestone is lock-timeout behavior that zeroizes the retained
-vault password and suspends inbound processing, followed by coordinated safe-save
-for outbound ratchet advancement and queue insertion. The manual live-Tor smoke
-test should later become an isolated, opt-in CI job.
+The next useful milestone is coordinated safe-save for outbound ratchet
+advancement and queue insertion. The manual live-Tor smoke test should later
+become an isolated, opt-in CI job.
 
 ## Resume notes
 
-Start with vault lock-timeout behavior and outbound safe-save coordination.
+Start with outbound safe-save coordination.
 The desktop transport configuration is:
 
 ```bash

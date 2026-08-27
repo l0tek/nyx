@@ -2,7 +2,10 @@ use dioxus::prelude::*;
 use nyx_crypto::MlsConversation;
 use nyx_store::DeliveryQueue;
 use nyx_tor::{OnionEndpoint, TorTransport};
-use std::{path::PathBuf, time::Duration};
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 use zeroize::{Zeroize, Zeroizing};
 
 const CSS: &str = r#"
@@ -40,7 +43,7 @@ button, input { font: inherit; }
 .warning { margin-top: 26px; color: #d8b96e; font-size: 12px; line-height: 1.5; }
 .vault { margin-top: 28px; padding-top: 20px; border-top: 1px solid #26303a; }
 .vault input { width: 100%; color: #edf4fa; background: #0a1016; border: 1px solid #33404d; border-radius: 9px; padding: 10px; margin: 9px 0; }
-.vault-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.vault-actions { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
 .vault button { color: #cdd9e3; background: #1a2530; border: 1px solid #33404d; border-radius: 8px; padding: 8px; cursor: pointer; }
 .vault button:disabled { opacity: .4; cursor: default; }
 .vault-result { color: #91abc1; font-size: 11px; margin-top: 9px; overflow-wrap: anywhere; }
@@ -72,6 +75,7 @@ pub fn App() -> Element {
     let mut vault_password = use_signal(String::new);
     let mut vault_status = use_signal(|| None::<String>);
     let autosave_password = use_signal(|| Zeroizing::new(Vec::<u8>::new()));
+    let mut vault_last_activity = use_signal(|| None::<Instant>);
     let delivery_queue = use_signal(|| {
         DeliveryQueue::open(delivery_queue_path()).map_err(|error| error.to_string())
     });
@@ -87,6 +91,15 @@ pub fn App() -> Element {
             messages,
             last_error,
             autosave_password,
+        )
+    });
+    use_future(move || {
+        run_vault_lock_timer(
+            autosave_password,
+            vault_last_activity,
+            conversation,
+            messages,
+            vault_status,
         )
     });
 
@@ -125,18 +138,26 @@ pub fn App() -> Element {
                         r#type: "password",
                         value: "{vault_password}",
                         placeholder: "Vault password",
-                        oninput: move |event| vault_password.set(event.value()),
+                        oninput: move |event| {
+                            vault_password.set(event.value());
+                            touch_vault(&mut vault_last_activity, &autosave_password);
+                        },
                     }
                     div { class: "vault-actions",
                         button {
                             disabled: !mls_ready || vault_password.read().is_empty(),
-                            onclick: move |_| save_session(&conversation, &mut vault_password, autosave_password, &mut vault_status),
+                            onclick: move |_| save_session(&conversation, &mut vault_password, autosave_password, &mut vault_last_activity, &mut vault_status),
                             "Save"
                         }
                         button {
                             disabled: vault_password.read().is_empty(),
-                            onclick: move |_| load_session(&mut conversation, &mut vault_password, autosave_password, &mut messages, &mut last_error, &mut vault_status),
+                            onclick: move |_| load_session(&mut conversation, &mut vault_password, autosave_password, &mut vault_last_activity, &mut messages, &mut last_error, &mut vault_status),
                             "Unlock"
+                        }
+                        button {
+                            disabled: autosave_password.read().is_empty(),
+                            onclick: move |_| lock_session(&mut conversation, autosave_password, &mut vault_last_activity, &mut messages, &mut vault_status),
+                            "Lock"
                         }
                     }
                     if let Some(status) = vault_status.read().as_ref() {
@@ -179,16 +200,23 @@ pub fn App() -> Element {
                             value: "{draft}",
                             placeholder: "Write a message for the MLS peer…",
                             disabled: !mls_ready,
-                            oninput: move |event| draft.set(event.value()),
+                            oninput: move |event| {
+                                draft.set(event.value());
+                                touch_vault(&mut vault_last_activity, &autosave_password);
+                            },
                             onkeydown: move |event| {
                                 if event.key() == Key::Enter {
+                                    touch_vault(&mut vault_last_activity, &autosave_password);
                                     send_message(&mut conversation, &delivery_queue, &mailbox_token, &mut draft, &mut messages, &mut last_error);
                                 }
                             }
                         }
                         button {
                             disabled: !mls_ready || draft.read().trim().is_empty(),
-                            onclick: move |_| send_message(&mut conversation, &delivery_queue, &mailbox_token, &mut draft, &mut messages, &mut last_error),
+                            onclick: move |_| {
+                                touch_vault(&mut vault_last_activity, &autosave_password);
+                                send_message(&mut conversation, &delivery_queue, &mailbox_token, &mut draft, &mut messages, &mut last_error);
+                            },
                             "Encrypt & send"
                         }
                     }
@@ -356,6 +384,7 @@ fn save_session(
     conversation: &Signal<Result<MlsConversation, String>>,
     password: &mut Signal<String>,
     mut autosave_password: Signal<Zeroizing<Vec<u8>>>,
+    last_activity: &mut Signal<Option<Instant>>,
     status: &mut Signal<Option<String>>,
 ) {
     let path = state_path();
@@ -368,6 +397,7 @@ fn save_session(
     match result {
         Ok(()) => {
             autosave_password.set(Zeroizing::new(password.read().as_bytes().to_vec()));
+            last_activity.set(Some(Instant::now()));
             status.set(Some(format!(
                 "Saved encrypted state to {}; inbound safe-save is active",
                 path.display()
@@ -382,6 +412,7 @@ fn load_session(
     conversation: &mut Signal<Result<MlsConversation, String>>,
     password: &mut Signal<String>,
     mut autosave_password: Signal<Zeroizing<Vec<u8>>>,
+    last_activity: &mut Signal<Option<Instant>>,
     messages: &mut Signal<Vec<DisplayMessage>>,
     last_error: &mut Signal<Option<String>>,
     status: &mut Signal<Option<String>>,
@@ -391,6 +422,7 @@ fn load_session(
     match result {
         Ok(restored) => {
             autosave_password.set(Zeroizing::new(password.read().as_bytes().to_vec()));
+            last_activity.set(Some(Instant::now()));
             conversation.set(Ok(restored));
             messages.write().clear();
             last_error.set(None);
@@ -450,5 +482,88 @@ fn send_message(
             Err(_) => last_error.set(Some("Peer returned invalid UTF-8 application data".into())),
         },
         Err(error) => last_error.set(Some(error)),
+    }
+}
+
+fn touch_vault(
+    last_activity: &mut Signal<Option<Instant>>,
+    autosave_password: &Signal<Zeroizing<Vec<u8>>>,
+) {
+    if !autosave_password.read().is_empty() {
+        last_activity.set(Some(Instant::now()));
+    }
+}
+
+fn lock_session(
+    conversation: &mut Signal<Result<MlsConversation, String>>,
+    mut autosave_password: Signal<Zeroizing<Vec<u8>>>,
+    last_activity: &mut Signal<Option<Instant>>,
+    messages: &mut Signal<Vec<DisplayMessage>>,
+    status: &mut Signal<Option<String>>,
+) {
+    autosave_password.set(Zeroizing::new(Vec::new()));
+    last_activity.set(None);
+    conversation.set(Err(
+        "Vault is locked; enter the password and select Unlock".into()
+    ));
+    messages.write().clear();
+    status.set(Some(
+        "Vault locked; MLS state and autosave password were removed from memory".into(),
+    ));
+}
+
+async fn run_vault_lock_timer(
+    autosave_password: Signal<Zeroizing<Vec<u8>>>,
+    last_activity: Signal<Option<Instant>>,
+    mut conversation: Signal<Result<MlsConversation, String>>,
+    mut messages: Signal<Vec<DisplayMessage>>,
+    mut status: Signal<Option<String>>,
+) {
+    let timeout = vault_lock_timeout();
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let expired = last_activity
+            .read()
+            .as_ref()
+            .is_some_and(|activity| activity.elapsed() >= timeout);
+        if expired && !autosave_password.read().is_empty() {
+            let mut activity = last_activity;
+            lock_session(
+                &mut conversation,
+                autosave_password,
+                &mut activity,
+                &mut messages,
+                &mut status,
+            );
+        }
+    }
+}
+
+fn vault_lock_timeout() -> Duration {
+    parse_vault_lock_timeout(std::env::var("NYX_VAULT_LOCK_TIMEOUT_SECS").ok().as_deref())
+}
+
+fn parse_vault_lock_timeout(value: Option<&str>) -> Duration {
+    const DEFAULT_SECONDS: u64 = 300;
+    const MINIMUM_SECONDS: u64 = 30;
+    const MAXIMUM_SECONDS: u64 = 86_400;
+    let seconds = value
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| (MINIMUM_SECONDS..=MAXIMUM_SECONDS).contains(seconds))
+        .unwrap_or(DEFAULT_SECONDS);
+    Duration::from_secs(seconds)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_vault_lock_timeout;
+
+    #[test]
+    fn vault_timeout_is_bounded_and_defaults_safely() {
+        assert_eq!(parse_vault_lock_timeout(None).as_secs(), 300);
+        assert_eq!(parse_vault_lock_timeout(Some("120")).as_secs(), 120);
+        assert_eq!(parse_vault_lock_timeout(Some("0")).as_secs(), 300);
+        assert_eq!(parse_vault_lock_timeout(Some("86401")).as_secs(), 300);
+        assert_eq!(parse_vault_lock_timeout(Some("invalid")).as_secs(), 300);
     }
 }
