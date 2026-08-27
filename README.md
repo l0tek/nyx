@@ -77,8 +77,10 @@ known limitations, and the remaining security work.
 The client transport and cryptographic crates intentionally contain explicit
 TODO boundaries. The server-side Arti Onion Service, opaque mailbox storage, and
 headless `nyx-tor` mailbox client are implemented, but the desktop UI is not
-connected to them. Do not replace the crypto boundary with ad-hoc cryptography.
-Integrate and test OpenMLS before enabling real user messaging.
+connected to them. OpenMLS device credentials and KeyPackage generation now
+exist in memory, while groups and encrypted persistence remain incomplete. Do
+not replace the crypto boundary with ad-hoc cryptography or enable real user
+messaging before the remaining OpenMLS work is tested.
 
 ## Security rule
 

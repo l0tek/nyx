@@ -37,16 +37,21 @@ not suitable for sensitive or production communication.
   acknowledgement, and deletion without transmitting user content.
 - Domain types for contacts and chat messages exist.
 - Envelope and encrypted-message serialization exists.
-- SQLite and cryptographic boundary crates exist as scaffolds.
-- The workspace currently has seven transport/mailbox/protocol unit tests covering request
-  serialization, oversized-frame rejection, receipt binding, mailbox lifecycle,
-  cross-mailbox ACK isolation, and invalid input rejection.
+- `nyx-crypto` generates an Ed25519 basic device credential and an RFC 9420
+  KeyPackage using OpenMLS with the X25519/AES-128-GCM/SHA-256 ciphersuite. The
+  provider is currently memory-backed and explicitly not production-persistent.
+- The SQLite client-store boundary remains a scaffold.
+- The workspace currently has nine crypto/transport/mailbox/protocol unit tests
+  covering MLS device material validation, request serialization,
+  oversized-frame rejection, receipt binding, mailbox lifecycle, cross-mailbox
+  ACK isolation, Onion endpoint validation, and invalid input rejection.
 
 ## Not implemented
 
 - The desktop UI is not connected to the implemented `nyx-tor` transport.
-- OpenMLS session/group creation, credential handling, encryption, decryption,
-  commits, and key persistence are not implemented.
+- OpenMLS group creation/joining, encryption, decryption, commits, and encrypted
+  key persistence are not implemented. Device credentials and KeyPackages are
+  currently volatile foundations only.
 - Device identity generation, contact invitations, out-of-band verification,
   and multi-device behavior are not implemented.
 - The local client store is not encrypted and contains only a generic `kv`
