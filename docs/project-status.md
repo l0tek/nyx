@@ -54,11 +54,20 @@ not suitable for sensitive or production communication.
   and XChaCha20-Poly1305. Headers are authenticated, derived keys and loaded
   plaintext are zeroized, files are atomically replaced, and Unix temporary
   files use mode `0600`.
+- `nyx-store` provides a separate SQLite ciphertext delivery queue. It records
+  enqueue time and attempts, validates size/token bounds, and hides delivered
+  items only after confirmation. No MLS key material is written to this queue.
+- The desktop send path places the exact serialized OpenMLS PrivateMessage into
+  that queue when `NYX_RECIPIENT_MAILBOX_TOKEN_HEX` is configured. The queue
+  path defaults to `nyx-delivery.sqlite3` and can be overridden with
+  `NYX_DELIVERY_QUEUE_PATH`.
+- `nyx-tor` can flush queued envelopes in order, record an attempt before each
+  request, and mark delivery only after the Onion mailbox confirms deposit.
 - The generic SQLite client-store boundary remains a separate scaffold.
 - The desktop sidebar provides explicit Save and Unlock actions for this MLS
   state. The vault password is zeroized after each operation. The location is
   `nyx-desktop-state.nyx` or `NYX_DESKTOP_STATE_PATH` when configured.
-- The workspace currently has fifteen store/crypto/transport/mailbox/protocol unit tests
+- The workspace currently has seventeen store/crypto/transport/mailbox/protocol unit tests
   covering MLS group/Welcome/message processing, replay rejection, device
   material validation, request serialization,
   oversized-frame rejection, receipt binding, mailbox lifecycle, cross-mailbox
@@ -66,8 +75,8 @@ not suitable for sensitive or production communication.
 
 ## Not implemented
 
-- The desktop UI exercises MLS locally but is not connected to the implemented
-  `nyx-tor` transport or mailbox server.
+- The desktop does not yet bootstrap and run the asynchronous Tor queue worker;
+  invoking the implemented queue flush still requires application wiring.
 - General group lifecycle operations, remote commit handling, removals, updates,
   and encrypted key/group-state persistence are not implemented. The current
   two-member MLS conversation is volatile and recreated on app start.
@@ -122,7 +131,8 @@ publication or reachability on the public Tor network.
 
 ## Next milestone
 
-The next useful milestone is a queue that moves serialized MLS messages between
-the desktop app and `nyx-tor`, with delivery state stored outside the MLS secret
-snapshot. Automatic safe-save and lock behavior should follow. The manual
-live-Tor smoke test should later become an isolated, opt-in CI job.
+The next useful milestone is a desktop-owned asynchronous worker that bootstraps
+Tor, flushes the new durable queue, reports retry state in the UI, and fetches
+and acknowledges inbound envelopes. Automatic safe-save and lock behavior
+should follow. The manual live-Tor smoke test should later become an isolated,
+opt-in CI job.

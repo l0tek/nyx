@@ -10,6 +10,7 @@ use nyx_protocol::{
     Envelope, MAX_FRAME_SIZE, MailboxRequest, MailboxResponse, StoredEnvelope, decode_response,
     encode_request,
 };
+use nyx_store::DeliveryQueue;
 use std::{sync::Arc, time::Duration};
 use tor_hsservice::HsId;
 use tor_rtcompat::PreferredRuntime;
@@ -37,6 +38,12 @@ impl OnionEndpoint {
 /// An Arti-backed transport that can only connect to validated Onion endpoints.
 pub struct TorTransport {
     client: Arc<TorClient<PreferredRuntime>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeliveryReport {
+    pub attempted: usize,
+    pub delivered: usize,
 }
 
 impl TorTransport {
@@ -140,6 +147,38 @@ impl TorTransport {
             MailboxResponse::Error(code) => bail!("mailbox rejected acknowledgement: {code:?}"),
             _ => bail!("mailbox returned an unexpected response to acknowledgement"),
         }
+    }
+
+    /// Sends pending ciphertexts in queue order and retains the first failed
+    /// item for a later retry. A delivery is removed from the pending view only
+    /// after the mailbox confirms its receipt.
+    pub async fn flush_delivery_queue(
+        &self,
+        endpoint: &OnionEndpoint,
+        queue: &DeliveryQueue,
+        limit: u16,
+    ) -> Result<DeliveryReport> {
+        let pending = queue
+            .pending(limit)
+            .context("read pending delivery queue")?;
+        let mut report = DeliveryReport {
+            attempted: 0,
+            delivered: 0,
+        };
+        for delivery in pending {
+            report.attempted += 1;
+            queue
+                .record_attempt(delivery.id)
+                .context("record mailbox delivery attempt")?;
+            self.deposit(endpoint, delivery.envelope)
+                .await
+                .context("deposit queued MLS ciphertext")?;
+            queue
+                .mark_delivered(delivery.id)
+                .context("mark mailbox delivery complete")?;
+            report.delivered += 1;
+        }
+        Ok(report)
     }
 }
 

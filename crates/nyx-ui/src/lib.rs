@@ -1,5 +1,6 @@
 use dioxus::prelude::*;
 use nyx_crypto::MlsConversation;
+use nyx_store::DeliveryQueue;
 use std::path::PathBuf;
 use zeroize::Zeroize;
 
@@ -48,6 +49,7 @@ button, input { font: inherit; }
 struct DisplayMessage {
     plaintext: String,
     ciphertext_size: usize,
+    queued: bool,
 }
 
 #[component]
@@ -61,6 +63,10 @@ pub fn App() -> Element {
     let mut last_error = use_signal(|| None::<String>);
     let mut vault_password = use_signal(String::new);
     let mut vault_status = use_signal(|| None::<String>);
+    let delivery_queue = use_signal(|| {
+        DeliveryQueue::open(delivery_queue_path()).map_err(|error| error.to_string())
+    });
+    let mailbox_token = mailbox_token_from_environment().ok();
 
     let mls_ready = conversation.read().is_ok();
     let member_count = conversation
@@ -85,7 +91,7 @@ pub fn App() -> Element {
                     span { "1:1 · {member_count} MLS members" }
                 }
                 p { class: "warning",
-                    "Local cryptographic demo. Tor mailbox delivery is not connected to this UI yet."
+                    if mailbox_token.is_some() { "MLS ciphertext is persisted to the Tor delivery queue." } else { "Set NYX_RECIPIENT_MAILBOX_TOKEN_HEX to enable durable delivery queueing." }
                 }
                 div { class: "vault",
                     div { class: "eyebrow", "Encrypted MLS state" }
@@ -131,7 +137,11 @@ pub fn App() -> Element {
                         for (index, message) in messages.read().iter().enumerate() {
                             div { class: "bubble", key: "{index}",
                                 p { "{message.plaintext}" }
-                                div { class: "meta", "MLS ciphertext: {message.ciphertext_size} bytes · decrypted by peer" }
+                                div { class: "meta",
+                                    "MLS ciphertext: {message.ciphertext_size} bytes · "
+                                    if message.queued { "queued for Tor delivery" } else { "local only" }
+                                    " · decrypted by peer"
+                                }
                             }
                         }
                         if let Some(error) = last_error.read().as_ref() {
@@ -146,13 +156,13 @@ pub fn App() -> Element {
                             oninput: move |event| draft.set(event.value()),
                             onkeydown: move |event| {
                                 if event.key() == Key::Enter {
-                                    send_message(&mut conversation, &mut draft, &mut messages, &mut last_error);
+                                    send_message(&mut conversation, &delivery_queue, &mailbox_token, &mut draft, &mut messages, &mut last_error);
                                 }
                             }
                         }
                         button {
                             disabled: !mls_ready || draft.read().trim().is_empty(),
-                            onclick: move |_| send_message(&mut conversation, &mut draft, &mut messages, &mut last_error),
+                            onclick: move |_| send_message(&mut conversation, &delivery_queue, &mailbox_token, &mut draft, &mut messages, &mut last_error),
                             "Encrypt & send"
                         }
                     }
@@ -166,6 +176,26 @@ fn state_path() -> PathBuf {
     std::env::var_os("NYX_DESKTOP_STATE_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("nyx-desktop-state.nyx"))
+}
+
+fn delivery_queue_path() -> PathBuf {
+    std::env::var_os("NYX_DELIVERY_QUEUE_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nyx-delivery.sqlite3"))
+}
+
+fn mailbox_token_from_environment() -> Result<[u8; 32], String> {
+    let encoded = std::env::var("NYX_RECIPIENT_MAILBOX_TOKEN_HEX")
+        .map_err(|_| "recipient mailbox token is not configured".to_owned())?;
+    if encoded.len() != 64 {
+        return Err("recipient mailbox token must contain 64 hexadecimal characters".into());
+    }
+    let mut token = [0_u8; 32];
+    for (index, byte) in token.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&encoded[index * 2..index * 2 + 2], 16)
+            .map_err(|_| "recipient mailbox token contains invalid hexadecimal data")?;
+    }
+    Ok(token)
 }
 
 fn save_session(
@@ -210,6 +240,8 @@ fn load_session(
 
 fn send_message(
     conversation: &mut Signal<Result<MlsConversation, String>>,
+    delivery_queue: &Signal<Result<DeliveryQueue, String>>,
+    mailbox_token: &Option<[u8; 32]>,
     draft: &mut Signal<String>,
     messages: &mut Signal<Vec<DisplayMessage>>,
     last_error: &mut Signal<Option<String>>,
@@ -219,17 +251,34 @@ fn send_message(
         return;
     }
     let result = match conversation.write().as_mut() {
-        Ok(conversation) => conversation
-            .round_trip_from_alice(plaintext.as_bytes())
-            .map_err(|error| error.to_string()),
+        Ok(conversation) => (|| {
+            let ciphertext = conversation
+                .encrypt_from_alice(plaintext.as_bytes())
+                .map_err(|error| error.to_string())?;
+            let queued = match (delivery_queue.read().as_ref(), mailbox_token.as_ref()) {
+                (Ok(queue), Some(token)) => {
+                    queue
+                        .enqueue(*token, &ciphertext)
+                        .map_err(|error| error.to_string())?;
+                    true
+                }
+                _ => false,
+            };
+            let ciphertext_size = ciphertext.len();
+            let decrypted = conversation
+                .decrypt_for_bob(&ciphertext)
+                .map_err(|error| error.to_string())?;
+            Ok((ciphertext_size, decrypted, queued))
+        })(),
         Err(error) => Err(error.clone()),
     };
     match result {
-        Ok((ciphertext_size, decrypted)) => match String::from_utf8(decrypted) {
+        Ok((ciphertext_size, decrypted, queued)) => match String::from_utf8(decrypted) {
             Ok(decrypted) => {
                 messages.write().push(DisplayMessage {
                     plaintext: decrypted,
                     ciphertext_size,
+                    queued,
                 });
                 draft.set(String::new());
                 last_error.set(None);

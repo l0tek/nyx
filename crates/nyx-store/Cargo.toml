@@ -13,3 +13,5 @@ chacha20poly1305.workspace = true
 zeroize.workspace = true
 rand.workspace = true
 tempfile.workspace = true
+uuid.workspace = true
+nyx-protocol = { path = "../nyx-protocol" }

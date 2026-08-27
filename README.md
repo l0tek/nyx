@@ -76,14 +76,16 @@ known limitations, and the remaining security work.
 
 The client transport and cryptographic crates intentionally contain explicit
 TODO boundaries. The server-side Arti Onion Service, opaque mailbox storage, and
-headless `nyx-tor` mailbox client are implemented, but the desktop UI is not
-connected to mailbox delivery. The desktop app demonstrates a real in-memory
+headless `nyx-tor` mailbox client are implemented. The desktop app demonstrates a real in-memory
 two-member OpenMLS group, Welcome processing, encryption, decryption, and replay
-protection. Encrypted persistence and remote group synchronization remain
-incomplete. The desktop sidebar can save and unlock the full in-memory OpenMLS
+protection. The desktop sidebar can save and unlock the full in-memory OpenMLS
 state through the Argon2id/XChaCha20-Poly1305 encrypted store. It writes
 `nyx-desktop-state.nyx` by default; use `NYX_DESKTOP_STATE_PATH` to override the
-location. Saving is still manual. Do not replace the crypto boundary with
+location. When `NYX_RECIPIENT_MAILBOX_TOKEN_HEX` contains a 32-byte token as 64
+hexadecimal characters, sent MLS ciphertext is durably queued in
+`nyx-delivery.sqlite3`; override it with `NYX_DELIVERY_QUEUE_PATH`. `nyx-tor`
+can flush this queue to a validated v3 Onion endpoint, but the desktop does not
+yet run that asynchronous worker automatically. Saving is still manual. Do not replace the crypto boundary with
 ad-hoc cryptography or use the demo for sensitive messaging.
 
 ## Security rule

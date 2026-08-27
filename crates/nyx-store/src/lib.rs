@@ -4,13 +4,16 @@ use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
     aead::{Aead, KeyInit, Payload},
 };
+use nyx_protocol::{Envelope, MAX_CIPHERTEXT_SIZE, PROTOCOL_VERSION};
 use rand::{RngCore, rngs::OsRng};
 use rusqlite::Connection;
 use std::{
     fs,
     io::{Read, Write},
     path::Path,
+    time::{SystemTime, UNIX_EPOCH},
 };
+use uuid::Uuid;
 use zeroize::Zeroizing;
 
 const ENCRYPTED_MAGIC: &[u8; 4] = b"NYXE";
@@ -22,6 +25,117 @@ const MAX_PLAINTEXT_SIZE: usize = 64 * 1024 * 1024;
 
 pub struct Store {
     conn: Connection,
+}
+
+#[derive(Debug, Clone)]
+pub struct QueuedDelivery {
+    pub id: Uuid,
+    pub envelope: Envelope,
+    pub queued_unix_ms: i64,
+    pub attempts: u32,
+}
+
+/// Durable ciphertext-only outbox. MLS key material never enters this database.
+pub struct DeliveryQueue {
+    conn: Connection,
+}
+
+impl DeliveryQueue {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let conn = Connection::open(path).context("open delivery queue")?;
+        conn.execute_batch(
+            r#"
+            PRAGMA journal_mode=WAL;
+            PRAGMA synchronous=FULL;
+            CREATE TABLE IF NOT EXISTS outbound_delivery (
+                id TEXT PRIMARY KEY NOT NULL,
+                mailbox_token BLOB NOT NULL CHECK(length(mailbox_token) = 32),
+                ciphertext BLOB NOT NULL,
+                queued_unix_ms INTEGER NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                delivered_unix_ms INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS outbound_delivery_pending
+                ON outbound_delivery(delivered_unix_ms, queued_unix_ms);
+            "#,
+        )
+        .context("initialize delivery queue")?;
+        Ok(Self { conn })
+    }
+
+    pub fn enqueue(&self, mailbox_token: [u8; 32], ciphertext: &[u8]) -> Result<Uuid> {
+        if ciphertext.is_empty() {
+            bail!("queued MLS ciphertext must not be empty");
+        }
+        if ciphertext.len() > MAX_CIPHERTEXT_SIZE {
+            bail!("queued MLS ciphertext exceeds maximum size");
+        }
+        let id = Uuid::new_v4();
+        self.conn.execute(
+            "INSERT INTO outbound_delivery (id, mailbox_token, ciphertext, queued_unix_ms) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![id.to_string(), mailbox_token.as_slice(), ciphertext, unix_time_ms()?],
+        )?;
+        Ok(id)
+    }
+
+    pub fn pending(&self, limit: u16) -> Result<Vec<QueuedDelivery>> {
+        if limit == 0 || limit > 128 {
+            bail!("delivery queue limit must be between 1 and 128");
+        }
+        let mut statement = self.conn.prepare(
+            "SELECT id, mailbox_token, ciphertext, queued_unix_ms, attempts FROM outbound_delivery WHERE delivered_unix_ms IS NULL ORDER BY queued_unix_ms, id LIMIT ?1",
+        )?;
+        let rows = statement.query_map([limit], |row| {
+            let id: String = row.get(0)?;
+            let token: Vec<u8> = row.get(1)?;
+            let ciphertext: Vec<u8> = row.get(2)?;
+            Ok((id, token, ciphertext, row.get(3)?, row.get::<_, u32>(4)?))
+        })?;
+        rows.map(|row| {
+            let (id, token, ciphertext, queued_unix_ms, attempts) = row?;
+            let mailbox_token: [u8; 32] = token
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("delivery queue contains an invalid mailbox token"))?;
+            Ok(QueuedDelivery {
+                id: Uuid::parse_str(&id).context("delivery queue contains an invalid id")?,
+                envelope: Envelope {
+                    version: PROTOCOL_VERSION,
+                    mailbox_token,
+                    ciphertext,
+                },
+                queued_unix_ms,
+                attempts,
+            })
+        })
+        .collect()
+    }
+
+    pub fn record_attempt(&self, id: Uuid) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE outbound_delivery SET attempts = attempts + 1 WHERE id = ?1 AND delivered_unix_ms IS NULL",
+            [id.to_string()],
+        )?;
+        if changed != 1 {
+            bail!("pending delivery does not exist");
+        }
+        Ok(())
+    }
+
+    pub fn mark_delivered(&self, id: Uuid) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE outbound_delivery SET delivered_unix_ms = ?1 WHERE id = ?2 AND delivered_unix_ms IS NULL",
+            rusqlite::params![unix_time_ms()?, id.to_string()],
+        )?;
+        if changed != 1 {
+            bail!("pending delivery does not exist");
+        }
+        Ok(())
+    }
+}
+
+fn unix_time_ms() -> Result<i64> {
+    let value = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+    i64::try_from(value).context("system time exceeds delivery timestamp range")
 }
 
 impl Store {
@@ -218,5 +332,34 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("state.nyx");
         assert!(EncryptedBlobStore::save(path, b"", b"state").is_err());
+    }
+
+    #[test]
+    fn delivery_queue_tracks_ciphertext_lifecycle() {
+        let directory = tempfile::tempdir().unwrap();
+        let queue = DeliveryQueue::open(directory.path().join("delivery.sqlite3")).unwrap();
+        let id = queue.enqueue([9; 32], b"serialized MLS message").unwrap();
+
+        let pending = queue.pending(10).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, id);
+        assert_eq!(pending[0].envelope.mailbox_token, [9; 32]);
+        assert_eq!(pending[0].envelope.ciphertext, b"serialized MLS message");
+        assert_eq!(pending[0].attempts, 0);
+
+        queue.record_attempt(id).unwrap();
+        assert_eq!(queue.pending(10).unwrap()[0].attempts, 1);
+        queue.mark_delivered(id).unwrap();
+        assert!(queue.pending(10).unwrap().is_empty());
+        assert!(queue.record_attempt(id).is_err());
+    }
+
+    #[test]
+    fn delivery_queue_rejects_invalid_inputs() {
+        let directory = tempfile::tempdir().unwrap();
+        let queue = DeliveryQueue::open(directory.path().join("delivery.sqlite3")).unwrap();
+        assert!(queue.enqueue([0; 32], b"").is_err());
+        assert!(queue.pending(0).is_err());
+        assert!(queue.pending(129).is_err());
     }
 }

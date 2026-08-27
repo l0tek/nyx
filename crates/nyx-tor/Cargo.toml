@@ -13,3 +13,4 @@ tor-rtcompat.workspace = true
 tor-hsservice.workspace = true
 futures.workspace = true
 nyx-protocol = { path = "../nyx-protocol" }
+nyx-store = { path = "../nyx-store" }

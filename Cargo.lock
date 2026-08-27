@@ -4831,9 +4831,11 @@ dependencies = [
  "anyhow",
  "argon2",
  "chacha20poly1305",
+ "nyx-protocol",
  "rand 0.8.8",
  "rusqlite",
  "tempfile",
+ "uuid",
  "zeroize",
 ]
 
@@ -4845,6 +4847,7 @@ dependencies = [
  "arti-client",
  "futures",
  "nyx-protocol",
+ "nyx-store",
  "tokio",
  "tor-hsservice",
  "tor-rtcompat",
@@ -4856,6 +4859,7 @@ version = "0.1.0"
 dependencies = [
  "dioxus",
  "nyx-crypto",
+ "nyx-store",
  "zeroize",
 ]
 
