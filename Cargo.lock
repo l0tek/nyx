@@ -4880,6 +4880,7 @@ dependencies = [
  "nyx-tor",
  "qrcode",
  "tokio",
+ "tracing",
  "uuid",
  "zeroize",
 ]

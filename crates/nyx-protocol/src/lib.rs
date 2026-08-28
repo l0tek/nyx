@@ -3,6 +3,8 @@ use thiserror::Error;
 use uuid::Uuid;
 
 pub const PROTOCOL_VERSION: u16 = 1;
+pub const DEFAULT_MAILBOX_ONION: &str =
+    "7fxtrjx4tgkga4cdspfx46u5zswncrjwso3cumpa3hhxqc3g7qt2cfyd.onion";
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MAX_CIPHERTEXT_SIZE: usize = MAX_FRAME_SIZE - 1024;
 pub const MAX_FETCH_MESSAGES: u16 = 128;

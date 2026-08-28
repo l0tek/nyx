@@ -1,9 +1,11 @@
 use anyhow::{Context, Result, bail};
-use arti_client::{TorClient, TorClientConfig, config::onion_service::OnionServiceConfigBuilder};
+use arti_client::config::onion_service::OnionServiceConfigBuilder;
+use arti_client::{TorClient, config::TorClientConfigBuilder};
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, StreamExt};
 use nyx_mailbox_server::{DEFAULT_RETENTION, MailboxStore};
 use nyx_protocol::{
-    MAX_FRAME_SIZE, MailboxErrorCode, MailboxResponse, decode_request, encode_response,
+    DEFAULT_MAILBOX_ONION, MAX_FRAME_SIZE, MailboxErrorCode, MailboxResponse, decode_request,
+    encode_response,
 };
 use safelog::DisplayRedacted;
 use std::{path::PathBuf, sync::Arc, time::Duration};
@@ -36,8 +38,21 @@ async fn main() -> Result<()> {
         DEFAULT_RETENTION,
     )?);
 
-    tracing::info!("bootstrapping Tor; no Clearnet listener will be opened");
-    let client = TorClient::create_bootstrapped(TorClientConfig::default())
+    let arti_state_dir = std::env::var_os("NYX_MAILBOX_ARTI_STATE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| data_dir.join("arti-state"));
+    let arti_cache_dir = std::env::var_os("NYX_MAILBOX_ARTI_CACHE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| data_dir.join("arti-cache"));
+    let tor_config = TorClientConfigBuilder::from_directories(&arti_state_dir, &arti_cache_dir)
+        .build()
+        .context("build persistent Tor configuration")?;
+
+    tracing::info!(
+        state_dir = %arti_state_dir.display(),
+        "bootstrapping Tor with persistent Onion identity; no Clearnet listener will be opened"
+    );
+    let client = TorClient::create_bootstrapped(tor_config)
         .await
         .context("bootstrap Tor")?;
     let nickname: HsNickname = "nyx-mailbox".parse().context("invalid service nickname")?;
@@ -56,6 +71,14 @@ async fn main() -> Result<()> {
         .onion_address()
         .map(|id| id.display_unredacted().to_string())
         .unwrap_or_else(|| "unavailable".to_owned());
+    let expected_onion = std::env::var("NYX_MAILBOX_EXPECTED_ONION")
+        .unwrap_or_else(|_| DEFAULT_MAILBOX_ONION.to_owned());
+    if onion_address != expected_onion {
+        bail!(
+            "persistent Onion identity mismatch: expected {expected_onion}, got {onion_address}; restore the matching Arti keystore in {}",
+            arti_state_dir.display()
+        );
+    }
     tracing::info!(address = %onion_address, port = ONION_PORT, "Nyx mailbox onion service running");
 
     let stream_requests = handle_rend_requests(rend_requests);

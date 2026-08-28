@@ -59,8 +59,13 @@ Run the mailbox Onion Service from the workspace root:
 cargo run -p nyx-mailbox-server
 ```
 
-On first start, Arti bootstraps Tor and creates a persistent v3 Onion Service
-identity. The server prints its `.onion` address once it is ready and accepts
+Arti stores the persistent v3 Onion Service identity below
+`nyx-mailbox-data/arti-state` and reuses it on every start. That directory,
+especially its keystore, must be preserved and backed up. The server refuses to
+start if the identity does not produce the client-pinned
+`7fxtrjx4tgkga4cdspfx46u5zswncrjwso3cumpa3hhxqc3g7qt2cfyd.onion` address; override
+the expected address with `NYX_MAILBOX_EXPECTED_ONION` only when intentionally
+rotating the identity and rebuilding/reconfiguring every client. The server accepts
 the Nyx binary mailbox protocol on virtual Onion port `443`. It does not open a
 local or Clearnet TCP listener. Opaque envelopes are retained for seven days in
 `nyx-mailbox-data/mailbox.sqlite3` by default. Override that directory with

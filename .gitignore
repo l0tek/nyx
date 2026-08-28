@@ -1,5 +1,6 @@
 /target
 /dist
+/nyx-mailbox-data/
 arti-client/
 .DS_Store
 *.db

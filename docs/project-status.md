@@ -183,18 +183,17 @@ not suitable for sensitive or production communication.
   `BarcodeDetector` QR support. Device-level camera scanning and Tor bootstrap
   still require acceptance testing on representative Android versions.
 
-## Current live integration blocker
+## Current live integration status
 
-- A real Android-to-desktop handshake remains unresolved. Both clients report
-  the Onion mailbox as connected. The server stores a correctly framed signed
-  `InvitationAcceptance` before the subsequent `MlsApplication` payloads, but
-  the desktop still reports `remote MLS session is not established` and does
-  not create/show the incoming phone contact.
-- The desktop restores twelve inbox capabilities. Diagnostic work confirmed
-  that the relevant acceptance and later messages remain unacknowledged in the
-  mailbox. The next step is privacy-safe per-inbox payload-kind tracing to prove
-  which capability is processed first and why the acceptance-bearing inbox is
-  not establishing its MLS session.
+- The receive worker no longer lets a stale, malformed, or otherwise rejected
+  item in one capability stop polling every remaining contact inbox. This was
+  able to starve a valid `InvitationAcceptance` in a later inbox indefinitely,
+  leaving its subsequent `MlsApplication` payloads without an established MLS
+  session.
+- Privacy-safe debug tracing now reports only inbox position, item count, and
+  payload kind. It never logs mailbox capabilities, receipts, sender IDs, or
+  message contents. The Android-to-desktop flow still needs a confirming run on
+  the public Tor test setup.
 
 ## Security limitations
 
@@ -235,17 +234,17 @@ packages live under the ignored `dist/` directory and are not part of Git.
 
 ## Next milestone
 
-The immediate milestone is resolving the Android-to-desktop invitation
-acceptance ordering/selection blocker and converting that reproduction into an
-isolated live-Tor integration test. Durable encrypted message history plus MLS
-update, removal, and KeyPackage rotation follow afterward.
+The immediate milestone is confirming the Android-to-desktop invitation fix on
+the public Tor test setup and converting that reproduction into an isolated
+live-Tor integration test. Durable encrypted message history plus MLS update,
+removal, and KeyPackage rotation follow afterward.
 
 ## Resume notes
 
-Start with privacy-safe per-inbox payload-kind tracing for the pending
-Android-to-desktop acceptance. Do not delete the queued mailbox rows before the
-failure is understood. Then continue with encrypted per-contact history and
-remote MLS commit lifecycle handling.
+Confirm the Android-to-desktop acceptance with privacy-safe per-inbox
+payload-kind tracing enabled. Do not delete the queued mailbox rows before that
+run. Then continue with encrypted per-contact history and remote MLS commit
+lifecycle handling.
 The legacy environment-based desktop transport configuration is:
 
 ```bash

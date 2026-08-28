@@ -1,6 +1,8 @@
 use dioxus::prelude::*;
 use nyx_crypto::{ContactRecord, DeviceIdentity, MlsConversation};
-use nyx_protocol::{ClientPayload, decode_client_payload, encode_client_payload};
+use nyx_protocol::{
+    ClientPayload, DEFAULT_MAILBOX_ONION, decode_client_payload, encode_client_payload,
+};
 use nyx_store::DeliveryQueue;
 use nyx_tor::{OnionEndpoint, TorTransport};
 use std::{
@@ -12,9 +14,8 @@ use zeroize::{Zeroize, Zeroizing};
 pub const CONFIG_MENU_ID: &str = "nyx-file-configuration";
 pub const IMPORT_CONTACT_MENU_ID: &str = "nyx-contact-import";
 pub const EXPORT_CONTACT_MENU_ID: &str = "nyx-contact-export";
-pub const DEFAULT_MAILBOX_ONION: &str =
+const RETIRED_MAILBOX_ONION: &str =
     "g3dafmnogfvgst67jmfujbglj2sj4egeieexriyg3jcbp3w3dgd4lnad.onion";
-
 const CSS: &str = r#"
 :root { font-family: Inter, system-ui, sans-serif; background: #090d12; color: #e6edf3; }
 * { box-sizing: border-box; }
@@ -994,9 +995,14 @@ async fn run_delivery_worker(
                 ),
             }
 
-            'inboxes: for token in receive_tokens {
+            for (inbox_index, token) in receive_tokens.into_iter().enumerate() {
                 match transport.fetch(&endpoint, token, 32).await {
                     Ok(envelopes) => {
+                        tracing::debug!(
+                            inbox_index,
+                            message_count = envelopes.len(),
+                            "checking contact inbox"
+                        );
                         let mut receipts = Vec::new();
                         for stored in envelopes {
                             let already_processed =
@@ -1021,8 +1027,19 @@ async fn run_delivery_worker(
                                 ));
                                 break;
                             }
-                            let decrypted = match decode_client_payload(&stored.envelope.ciphertext)
-                            {
+                            let payload = decode_client_payload(&stored.envelope.ciphertext);
+                            tracing::debug!(
+                                inbox_index,
+                                payload_kind = match &payload {
+                                    Ok(ClientPayload::InvitationAcceptance(_)) => {
+                                        "invitation-acceptance"
+                                    }
+                                    Ok(ClientPayload::MlsApplication { .. }) => "mls-application",
+                                    Err(_) => "legacy-or-invalid",
+                                },
+                                "processing inbox payload"
+                            );
+                            let decrypted = match payload {
                                 Ok(ClientPayload::InvitationAcceptance(acceptance)) => {
                                     let mut state = identity.write();
                                     let device = state
@@ -1128,7 +1145,10 @@ async fn run_delivery_worker(
                                     // application messages depend on a preceding
                                     // successful invitation acceptance and would
                                     // otherwise overwrite the useful error.
-                                    break 'inboxes;
+                                    // A stale or malformed item in one capability must not
+                                    // prevent a valid contact acceptance waiting in another
+                                    // inbox from establishing its MLS session.
+                                    break;
                                 }
                             }
                         }
@@ -1214,6 +1234,18 @@ fn authenticate_account(
                 .map_err(|error| error.to_string())?;
             device
         };
+        if let Some(index) = device
+            .mailboxes()
+            .iter()
+            .position(|address| address == RETIRED_MAILBOX_ONION)
+        {
+            device
+                .update_mailbox(index, DEFAULT_MAILBOX_ONION)
+                .map_err(|error| error.to_string())?;
+            device
+                .save_encrypted(identity_path(), &password_bytes)
+                .map_err(|error| error.to_string())?;
+        }
         if device.mailbox_onion().is_none() && !mailbox_onion.read().trim().is_empty() {
             let current_name = device.display_name().to_owned();
             device

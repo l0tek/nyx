@@ -16,6 +16,7 @@ tokio.workspace = true
 zeroize.workspace = true
 dotenvy.workspace = true
 qrcode.workspace = true
+tracing.workspace = true
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"
