@@ -85,6 +85,11 @@ not use real message content and deletes its test envelope on success.
 See [`docs/project-status.md`](docs/project-status.md) for implemented features,
 known limitations, and the remaining security work.
 
+A complete German, website-ready guide covering architecture, installation,
+operation, security, Tor, MLS, Meshtastic, troubleshooting, and development is
+available at
+[`docs/website-documentation.de.md`](docs/website-documentation.de.md).
+
 The client transport and cryptographic crates intentionally contain explicit
 security boundaries. The server-side Arti Onion Service, opaque mailbox storage,
 and headless `nyx-tor` mailbox client are implemented. The desktop app provides
