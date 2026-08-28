@@ -1,2 +1,7 @@
 [android.permissions]
 "android.permission.CAMERA" = { description = "Scan signed Nyx contact invitation QR codes" }
+"android.permission.BLUETOOTH" = { description = "Connect to Meshtastic radios on Android 11 and older" }
+"android.permission.BLUETOOTH_ADMIN" = { description = "Discover Meshtastic radios on Android 11 and older" }
+"android.permission.BLUETOOTH_SCAN" = { description = "Find nearby Meshtastic radios" }
+"android.permission.BLUETOOTH_CONNECT" = { description = "Connect to a selected Meshtastic radio" }
+"android.permission.ACCESS_FINE_LOCATION" = { description = "Bluetooth discovery compatibility on Android 11 and older" }

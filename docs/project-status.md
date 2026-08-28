@@ -1,6 +1,6 @@
 # Nyx project status
 
-Status date: 2026-08-27
+Status date: 2026-08-28
 
 Nyx is an architecture/MVP implementation. It is not security-audited and is
 not suitable for sensitive or production communication.
@@ -34,6 +34,32 @@ not suitable for sensitive or production communication.
   forward controls. Local registration and password login remain available.
   This is an encrypted on-device profile, not a central account: no e-mail,
   telephone number, directory username, or authentication server is involved.
+- Meshtastic integration is available as an additional local radio transport.
+  Linux, Windows, and macOS use the official Rust `meshtastic` crate over
+  USB-Serial at 115200 baud. Android uses a native Kotlin/JNI Bluetooth Low
+  Energy plugin and the official Meshtastic GATT service UUID; Android does not
+  expose the USB transport.
+- The configuration screen can scan for serial/BLE devices, select a discovered
+  device from a drop-down or accept a manually entered port/address, connect,
+  disconnect, and report connection errors. The main status screen always shows
+  Meshtastic state and links directly to its setup.
+- A configured desktop radio reports the local Meshtastic node ID, node name,
+  hardware model, NodeDB size, battery, voltage, channel utilization, firmware
+  environment, selected port, and observed PhoneAPI packet count when supplied
+  by the firmware.
+- Outbound delivery now follows a Tor-first policy. Only after Tor bootstrap,
+  Onion health, or mailbox deposit fails does the worker offer pending, already
+  MLS-encrypted client payloads to an active Meshtastic USB session. The target
+  is the hexadecimal node ID in `NYX_MESHTASTIC_DESTINATION`.
+- The experimental Meshtastic fallback uses `PRIVATE_APP`, unicast packets and
+  per-fragment `want_ack`. A versioned `NYXM` envelope carries the stable queue
+  UUID, fragment index/count, and a truncated BLAKE3 whole-message digest.
+  Payloads are split below Meshtastic's 233-byte application limit and capped at
+  16 KiB. Unit tests verify bounds, stable identity, and invalid-size rejection.
+- Dispatching fragments to a radio deliberately does not mark the durable Tor
+  queue item delivered. A radio ACK is not proof that the peer reassembled and
+  committed the MLS message. Tor therefore remains eligible to retry, while MLS
+  replay rejection protects against a later duplicate.
 - A persistent device identity contains a separate Ed25519 invitation-signing
   key, stable device UUID, OpenMLS signing material/provider state, a validated
   RFC 9420 KeyPackage, contacts, and outstanding directional capabilities. It is
@@ -182,6 +208,13 @@ not suitable for sensitive or production communication.
 - Android QR scanning depends on camera permission and the system WebView's
   `BarcodeDetector` QR support. Device-level camera scanning and Tor bootstrap
   still require acceptance testing on representative Android versions.
+- Meshtastic inbound `NYXM` reassembly, end-to-end fallback receipts, selective
+  missing-fragment retransmission, durable fragment state, Android BLE payload
+  transfer, and automatic peer-node binding to a verified Nyx contact are not
+  implemented. Until those pieces exist, the current Tor-first Meshtastic path
+  is an experimental outbound dispatch mechanism, not a complete alternative
+  delivery channel. Initial MLS Welcome/KeyPackage transfer and large files
+  remain Tor/QR-only. No radio hardware interoperability test has been run.
 
 ## Current live integration status
 
@@ -215,6 +248,13 @@ not suitable for sensitive or production communication.
 - The MLS snapshot currently mirrors OpenMLS MemoryStorage's internal key/value
   representation. It is versioned by Nyx but still needs explicit migration
   tests before OpenMLS dependency upgrades.
+- Meshtastic exposes radio node identifiers, timing, packet counts, approximate
+  message size, and RF topology even though the application body remains MLS
+  ciphertext. Meshtastic channel or PKI encryption is defense in depth and is
+  never trusted as a replacement for MLS authentication. The default public
+  LongFast channel is inappropriate for sensitive traffic.
+- The official Rust Meshtastic dependency is GPL-3.0. Distribution of linked
+  desktop binaries requires a license-compliance decision for the combined work.
 
 ## Verified in this revision
 
@@ -231,13 +271,19 @@ publication or reachability on the public Tor network.
 Desktop Linux and Android debug packages were also built in this revision. The
 Android package contains both `arm64-v8a` and `x86_64` native libraries. Generated
 packages live under the ignored `dist/` directory and are not part of Git.
+Use `scripts/build-android.sh` for universal APKs. It explicitly rebuilds both
+architectures and packages the Dioxus-provided OpenSSL libraries required by
+Arti; invoking separate `dx build --target` commands without that final packaging
+step can create an APK that crashes at startup because `libssl.so` is absent.
 
 ## Next milestone
 
-The immediate milestone is confirming the Android-to-desktop invitation fix on
-the public Tor test setup and converting that reproduction into an isolated
-live-Tor integration test. Durable encrypted message history plus MLS update,
-removal, and KeyPackage rotation follow afterward.
+The immediate Meshtastic milestone is implementing authenticated inbound
+fragment reassembly and an MLS-processing receipt before allowing a successful
+radio fallback to retire a Tor queue item. Selective retransmission, durable
+partial state, verified contact-to-node binding, and Android BLE payload transfer
+follow. The Tor milestone remains confirming Android-to-desktop invitation flow
+on the public test setup and converting it into an isolated live integration test.
 
 ## Resume notes
 
@@ -252,6 +298,7 @@ export NYX_MAILBOX_ONION="<v3-address>.onion"
 export NYX_MAILBOX_PORT="443"
 export NYX_RECIPIENT_MAILBOX_TOKEN_HEX="<64 hexadecimal characters>"
 export NYX_LOCAL_MAILBOX_TOKEN_HEX="<64 hexadecimal characters>"
+export NYX_MESHTASTIC_DESTINATION="!a1b2c3d4"
 cd apps/desktop
 dx serve --desktop
 ```

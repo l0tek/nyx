@@ -11,6 +11,13 @@ use std::{
 };
 use zeroize::{Zeroize, Zeroizing};
 
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+mod mesh_fragment;
+#[cfg(target_os = "android")]
+mod meshtastic_ble;
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+mod meshtastic_usb;
+
 pub const CONFIG_MENU_ID: &str = "nyx-file-configuration";
 pub const IMPORT_CONTACT_MENU_ID: &str = "nyx-contact-import";
 pub const EXPORT_CONTACT_MENU_ID: &str = "nyx-contact-export";
@@ -29,7 +36,7 @@ button, input { font: inherit; }
 @keyframes nyx-spin { to { transform: rotate(360deg); } }
 .field { display: grid; gap: 6px; margin-top: 16px; }
 .field label { color: #8997a5; font-size: 12px; }
-.field input, .field textarea { width: 100%; color: #edf4fa; background: #090f15; border: 1px solid #33404d; border-radius: 10px; padding: 12px; resize: vertical; }
+.field input, .field textarea, .field select { width: 100%; color: #edf4fa; background: #090f15; border: 1px solid #33404d; border-radius: 10px; padding: 12px; resize: vertical; }
 .primary { width: 100%; margin-top: 18px; border: 0; border-radius: 10px; padding: 12px; background: #8dd39e; color: #07110a; font-weight: 700; cursor: pointer; }
 .primary:disabled { opacity: .45; }
 .app { min-height: 100vh; display: grid; grid-template-columns: 290px 1fr; }
@@ -157,6 +164,21 @@ struct MailboxConnectionStatus {
     last_success: Option<Instant>,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct MeshtasticStatus {
+    connected: bool,
+    detail: String,
+}
+
+impl MeshtasticStatus {
+    fn idle() -> Self {
+        Self {
+            connected: false,
+            detail: "Kein Meshtastic-Gerät verbunden".into(),
+        }
+    }
+}
+
 impl MailboxConnectionStatus {
     fn initial() -> Self {
         Self {
@@ -223,6 +245,10 @@ pub fn App() -> Element {
     let mut config_name = use_signal(String::new);
     let mut config_onion = use_signal(default_mailbox_onion);
     let mut config_status = use_signal(|| None::<String>);
+    let mut meshtastic_ports = use_signal(Vec::<String>::new);
+    let mut meshtastic_port = use_signal(String::new);
+    let meshtastic_status = use_signal(MeshtasticStatus::idle);
+    let meshtastic_session = use_signal(|| 0_u64);
     let mailbox_onion = use_signal(default_mailbox_onion);
     let mut startup_ready = use_signal(|| false);
     let mut startup_error = use_signal(|| None::<String>);
@@ -516,6 +542,25 @@ pub fn App() -> Element {
                         p { class: "transport-state", "{mailbox_last_success}" }
                         if let Some(endpoint) = mailbox_status.endpoint.as_ref() { p { class: "transport-endpoint", "{endpoint}" } }
                         if let Some(error) = last_error.read().as_ref() { div { class: "error", "{error}" } }
+                        div { class: "transport",
+                            div { class: "eyebrow", "Meshtastic" }
+                            div { class: "connection-line",
+                                span { class: if meshtastic_status.read().connected { "connection-dot connected" } else { "connection-dot" } }
+                                strong { if meshtastic_status.read().connected { "Meshtastic verbunden" } else { "Meshtastic nicht verbunden" } }
+                            }
+                            p { class: "transport-state", "{meshtastic_status.read().detail}" }
+                            if !meshtastic_port.read().trim().is_empty() {
+                                p { class: "transport-endpoint", if cfg!(target_os = "android") { "Bluetooth: {meshtastic_port}" } else { "USB: {meshtastic_port}" } }
+                            }
+                            button {
+                                class: "mini-button",
+                                onclick: move |_| {
+                                    open_configuration(&identity, &mut config_name, &mut config_onion, &mut config_status);
+                                    navigate_to(&mut app_view, AppView::Configuration, &mut back_history, &mut forward_history);
+                                },
+                                if meshtastic_status.read().connected { "Meshtastic verwalten" } else { "Meshtastic einrichten" }
+                            }
+                        }
                         div { class: "identity-card", strong { "{profile_name}" } div { class: "fingerprint", "{profile_fingerprint}" } }
                     }
                 } else if *app_view.read() == AppView::Configuration {
@@ -549,6 +594,57 @@ pub fn App() -> Element {
                         }
                         if let Some(status) = config_status.read().as_ref() {
                             div { class: "tool-status", "{status}" }
+                        }
+                        div { class: "transport",
+                            div { class: "eyebrow", "Meshtastic" }
+                            h3 { if cfg!(target_os = "android") { "Bluetooth-Verbindung" } else { "USB-Verbindung" } }
+                            p { class: "subtle", if cfg!(target_os = "android") { "Meshtastic-Funkgerät über Bluetooth Low Energy verbinden." } else { "Meshtastic-Funkgerät über USB-Serial (115200 Baud) verbinden." } }
+                            div { class: "connection-line",
+                                span { class: if meshtastic_status.read().connected { "connection-dot connected" } else { "connection-dot" } }
+                                strong { if meshtastic_status.read().connected { "Verbunden" } else { "Nicht verbunden" } }
+                            }
+                            p { class: "transport-state", "{meshtastic_status.read().detail}" }
+                            div { class: "field",
+                                label { if cfg!(target_os = "android") { "Bluetooth-Adresse manuell" } else { "Seriellen Port manuell eingeben" } }
+                                input {
+                                    value: "{meshtastic_port}",
+                                    placeholder: if cfg!(target_os = "android") { "Bluetooth-Adresse" } else { "/dev/ttyACM0 oder COM3" },
+                                    oninput: move |event| meshtastic_port.set(event.value()),
+                                }
+                            }
+                            if !meshtastic_ports.read().is_empty() {
+                                div { class: "field",
+                                    label { if cfg!(target_os = "android") { "Gefundenes Bluetooth-Gerät auswählen" } else { "Gefundenen seriellen Port auswählen" } }
+                                    select {
+                                        value: "{meshtastic_port}",
+                                        onchange: move |event| meshtastic_port.set(event.value()),
+                                        option { value: "", "Bitte auswählen …" }
+                                        for port in meshtastic_ports.read().iter() {
+                                            option { key: "{port}", value: "{port}", "{port}" }
+                                        }
+                                    }
+                                }
+                            }
+                            if meshtastic_status.read().connected {
+                                div { class: "identity-card",
+                                    strong { "Meshtastic-Geräteinformationen" }
+                                    p { class: "transport-state", "{meshtastic_status.read().detail}" }
+                                    p { class: "transport-endpoint", if cfg!(target_os = "android") { "Transport: Bluetooth Low Energy · Meshtastic GATT" } else { "Transport: USB-Serial · 115200 Baud · Meshtastic Stream API" } }
+                                }
+                            }
+                            div { class: "tool-actions",
+                                button { onclick: move |_| refresh_meshtastic_ports(&mut meshtastic_ports, &mut meshtastic_port, meshtastic_status), "Geräte suchen" }
+                                button {
+                                    disabled: meshtastic_port.read().trim().is_empty() || meshtastic_status.read().connected,
+                                    onclick: move |_| connect_meshtastic_usb(meshtastic_port.read().trim().to_owned(), meshtastic_status, meshtastic_session),
+                                    "Verbinden"
+                                }
+                                button {
+                                    disabled: !meshtastic_status.read().connected,
+                                    onclick: move |_| disconnect_meshtastic_usb(meshtastic_status, meshtastic_session),
+                                    "Trennen"
+                                }
+                            }
                         }
                         div { class: "config-actions",
                             button { class: "primary", onclick: move |_| save_configuration(&mut identity, autosave_password, &config_name, &config_onion, mailbox_onion, &mut config_status), "Save" }
@@ -715,6 +811,137 @@ pub fn App() -> Element {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+fn refresh_meshtastic_ports(
+    ports: &mut Signal<Vec<String>>,
+    selected: &mut Signal<String>,
+    mut status: Signal<MeshtasticStatus>,
+) {
+    match meshtastic_usb::available_ports() {
+        Ok(found) => {
+            if selected.read().trim().is_empty() && found.len() == 1 {
+                selected.set(found[0].clone());
+            }
+            status.set(MeshtasticStatus {
+                connected: false,
+                detail: format!("{} serieller Port(s) gefunden", found.len()),
+            });
+            ports.set(found);
+        }
+        Err(error) => status.set(MeshtasticStatus {
+            connected: false,
+            detail: error,
+        }),
+    }
+}
+
+#[cfg(target_os = "android")]
+fn refresh_meshtastic_ports(
+    ports: &mut Signal<Vec<String>>,
+    selected: &mut Signal<String>,
+    mut status: Signal<MeshtasticStatus>,
+) {
+    match meshtastic_ble::scan_devices() {
+        Ok(detail) => {
+            status.set(MeshtasticStatus {
+                connected: false,
+                detail,
+            });
+            let mut ports = *ports;
+            let mut selected = *selected;
+            spawn(async move {
+                tokio::time::sleep(Duration::from_secs(11)).await;
+                match meshtastic_ble::list_devices() {
+                    Ok(found) => {
+                        let scan_state = meshtastic_ble::scan_status()
+                            .unwrap_or_else(|error| format!("ERROR: {error}"));
+                        if selected.read().trim().is_empty() && found.len() == 1 {
+                            selected.set(found[0].clone());
+                        }
+                        let detail = if scan_state.starts_with("ERROR:") {
+                            scan_state
+                        } else if found.is_empty() {
+                            "Suche beendet: kein Bluetooth-LE-Gerät empfangen".to_owned()
+                        } else {
+                            format!(
+                                "Suche beendet: {} Bluetooth-LE-Gerät(e) gefunden; Meshtastic wird beim Verbinden geprüft",
+                                found.len()
+                            )
+                        };
+                        ports.set(found);
+                        status.set(MeshtasticStatus {
+                            connected: false,
+                            detail,
+                        });
+                    }
+                    Err(error) => status.set(MeshtasticStatus {
+                        connected: false,
+                        detail: error,
+                    }),
+                }
+            });
+        }
+        Err(error) => status.set(MeshtasticStatus {
+            connected: false,
+            detail: error,
+        }),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+fn connect_meshtastic_usb(
+    port: String,
+    mut status: Signal<MeshtasticStatus>,
+    mut session: Signal<u64>,
+) {
+    let id = session().wrapping_add(1);
+    session.set(id);
+    status.set(MeshtasticStatus {
+        connected: false,
+        detail: format!("Verbinde mit {port} …"),
+    });
+    spawn(async move { meshtastic_usb::run_session(port, id, status, session).await });
+}
+
+#[cfg(target_os = "android")]
+fn connect_meshtastic_usb(
+    port: String,
+    mut status: Signal<MeshtasticStatus>,
+    mut session: Signal<u64>,
+) {
+    let id = session().wrapping_add(1);
+    session.set(id);
+    match meshtastic_ble::connect_device(&port) {
+        Ok(detail) => {
+            status.set(MeshtasticStatus {
+                connected: false,
+                detail,
+            });
+            spawn(async move { meshtastic_ble::monitor(id, status, session).await });
+        }
+        Err(error) => status.set(MeshtasticStatus {
+            connected: false,
+            detail: error,
+        }),
+    }
+}
+
+fn disconnect_meshtastic_usb(mut status: Signal<MeshtasticStatus>, mut session: Signal<u64>) {
+    session.set(session().wrapping_add(1));
+    #[cfg(target_os = "android")]
+    if let Err(error) = meshtastic_ble::disconnect_device() {
+        status.set(MeshtasticStatus {
+            connected: false,
+            detail: error,
+        });
+        return;
+    }
+    status.set(MeshtasticStatus {
+        connected: false,
+        detail: "Meshtastic-Verbindung wird getrennt …".into(),
+    });
+}
+
 fn state_path() -> PathBuf {
     std::env::var_os("NYX_DESKTOP_STATE_PATH")
         .map(PathBuf::from)
@@ -875,10 +1102,19 @@ async fn run_delivery_worker(
         let transport = match TorTransport::bootstrap_in(app_data_path("arti-client")).await {
             Ok(transport) => transport,
             Err(error) => {
+                let fallback = attempt_meshtastic_fallback(&queue).await;
                 update_connection_status(
                     &mut status,
                     ConnectionPhase::Degraded,
-                    format!("Tor bootstrap failed; retrying: {error:#}"),
+                    match fallback {
+                        Ok(count) if count > 0 => format!(
+                            "Tor bootstrap failed ({error:#}); dispatched {count} queued message(s) to Meshtastic fallback"
+                        ),
+                        Ok(_) => format!("Tor bootstrap failed; retrying: {error:#}"),
+                        Err(mesh_error) => format!(
+                            "Tor bootstrap failed ({error:#}); Meshtastic fallback unavailable: {mesh_error}"
+                        ),
+                    },
                     Some(endpoint.host.clone()),
                     false,
                 );
@@ -926,10 +1162,19 @@ async fn run_delivery_worker(
                     true,
                 ),
                 Err(error) => {
+                    let fallback = attempt_meshtastic_fallback(&queue).await;
                     update_connection_status(
                         &mut status,
                         ConnectionPhase::Degraded,
-                        format!("Mailbox health check failed: {error}"),
+                        match fallback {
+                            Ok(count) if count > 0 => format!(
+                                "Mailbox health check failed ({error}); dispatched {count} queued message(s) to Meshtastic fallback"
+                            ),
+                            Ok(_) => format!("Mailbox health check failed: {error}"),
+                            Err(mesh_error) => format!(
+                                "Mailbox health check failed ({error}); Meshtastic fallback unavailable: {mesh_error}"
+                            ),
+                        },
                         Some(endpoint.host.clone()),
                         false,
                     );
@@ -989,10 +1234,21 @@ async fn run_delivery_worker(
                         receive_tokens.len()
                     ),
                 ),
-                Err(error) => update_connection_detail(
-                    &mut status,
-                    format!("Delivery failed; queued for retry: {error}"),
-                ),
+                Err(error) => {
+                    let fallback = attempt_meshtastic_fallback(&queue).await;
+                    update_connection_detail(
+                        &mut status,
+                        match fallback {
+                            Ok(count) if count > 0 => format!(
+                                "Tor delivery failed ({error}); dispatched {count} queued message(s) to Meshtastic fallback"
+                            ),
+                            Ok(_) => format!("Delivery failed; queued for retry: {error}"),
+                            Err(mesh_error) => format!(
+                                "Tor delivery failed ({error}); Meshtastic fallback unavailable: {mesh_error}"
+                            ),
+                        },
+                    );
+                }
             }
 
             for (inbox_index, token) in receive_tokens.into_iter().enumerate() {
@@ -1177,6 +1433,22 @@ async fn run_delivery_worker(
             tokio::time::sleep(Duration::from_secs(10)).await;
         }
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+async fn attempt_meshtastic_fallback(queue: &DeliveryQueue) -> Result<usize, String> {
+    let mut dispatched = 0;
+    for item in queue.pending(8).map_err(|error| error.to_string())? {
+        if meshtastic_usb::dispatch_fallback(item.id, item.envelope.ciphertext).await? {
+            dispatched += 1;
+        }
+    }
+    Ok(dispatched)
+}
+
+#[cfg(target_os = "android")]
+async fn attempt_meshtastic_fallback(_queue: &DeliveryQueue) -> Result<usize, String> {
+    Err("Android BLE fallback data transport is not available yet".into())
 }
 
 fn update_connection_status(
