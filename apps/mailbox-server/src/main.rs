@@ -8,7 +8,11 @@ use nyx_protocol::{
     encode_response,
 };
 use safelog::DisplayRedacted;
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 use tor_cell::relaycell::msg::Connected;
 use tor_hsservice::{HsNickname, handle_rend_requests};
 use tor_proto::stream::IncomingStreamRequest;
@@ -41,6 +45,20 @@ async fn main() -> Result<()> {
     let arti_state_dir = std::env::var_os("NYX_MAILBOX_ARTI_STATE_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| data_dir.join("arti-state"));
+    let reinitialize_onion_identity = std::env::args_os()
+        .skip(1)
+        .any(|argument| argument == "--reinitialize-onion-identity")
+        || environment_switch("NYX_MAILBOX_REINITIALIZE_ONION_IDENTITY");
+    if reinitialize_onion_identity {
+        if let Some(backup) = backup_onion_identity(&arti_state_dir)? {
+            tracing::warn!(
+                previous_state = %backup.display(),
+                "previous Onion identity was backed up before reinitialization"
+            );
+        } else {
+            tracing::info!("no previous Onion identity exists; creating a new one");
+        }
+    }
     let arti_cache_dir = std::env::var_os("NYX_MAILBOX_ARTI_CACHE_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| data_dir.join("arti-cache"));
@@ -73,10 +91,17 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| "unavailable".to_owned());
     let expected_onion = std::env::var("NYX_MAILBOX_EXPECTED_ONION")
         .unwrap_or_else(|_| DEFAULT_MAILBOX_ONION.to_owned());
-    if onion_address != expected_onion {
+    if onion_address != expected_onion && !reinitialize_onion_identity {
         bail!(
             "persistent Onion identity mismatch: expected {expected_onion}, got {onion_address}; restore the matching Arti keystore in {}",
             arti_state_dir.display()
+        );
+    }
+    if onion_address != expected_onion {
+        tracing::warn!(
+            previous_expected = %expected_onion,
+            new_onion = %onion_address,
+            "Onion identity was reinitialized; update NYX_MAILBOX_EXPECTED_ONION and all clients"
         );
     }
     tracing::info!(address = %onion_address, port = ONION_PORT, "Nyx mailbox onion service running");
@@ -122,6 +147,41 @@ async fn main() -> Result<()> {
     }
     drop(service);
     Ok(())
+}
+
+fn environment_switch(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+fn backup_onion_identity(state_dir: &std::path::Path) -> Result<Option<PathBuf>> {
+    if !state_dir.exists() {
+        return Ok(None);
+    }
+    let parent = state_dir
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Arti state directory has no parent"))?;
+    let name = state_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("Arti state directory name is invalid"))?;
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("read system time for Onion identity backup")?
+        .as_millis();
+    let backup = parent.join(format!("{name}.backup-{timestamp}"));
+    std::fs::rename(state_dir, &backup).with_context(|| {
+        format!(
+            "back up Onion identity from {} to {}",
+            state_dir.display(),
+            backup.display()
+        )
+    })?;
+    Ok(Some(backup))
 }
 
 async fn serve_stream<S>(mut stream: S, store: Arc<MailboxStore>) -> Result<()>

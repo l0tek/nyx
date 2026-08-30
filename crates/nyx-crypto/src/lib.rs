@@ -50,6 +50,58 @@ pub struct ContactRecord {
     /// Token polled by this device for messages sent by the contact.
     pub receive_mailbox_token: [u8; 32],
     pub verified: bool,
+    /// Meshtastic destination bound locally to this verified contact.
+    pub meshtastic_node_id: Option<u32>,
+}
+
+#[derive(Clone, Debug, SerdeSerialize, SerdeDeserialize)]
+struct PreviousContactRecord {
+    invitation_id: Uuid,
+    device_id: Uuid,
+    display_name: String,
+    identity_public_key: [u8; 32],
+    identity_fingerprint: String,
+    mls_key_package: Vec<u8>,
+    mailbox_onion: String,
+    send_mailbox_token: [u8; 32],
+    receive_mailbox_token: [u8; 32],
+    verified: bool,
+}
+
+impl From<PreviousContactRecord> for ContactRecord {
+    fn from(contact: PreviousContactRecord) -> Self {
+        Self {
+            invitation_id: contact.invitation_id,
+            device_id: contact.device_id,
+            display_name: contact.display_name,
+            identity_public_key: contact.identity_public_key,
+            identity_fingerprint: contact.identity_fingerprint,
+            mls_key_package: contact.mls_key_package,
+            mailbox_onion: contact.mailbox_onion,
+            send_mailbox_token: contact.send_mailbox_token,
+            receive_mailbox_token: contact.receive_mailbox_token,
+            verified: contact.verified,
+            meshtastic_node_id: None,
+        }
+    }
+}
+
+#[cfg(test)]
+impl From<ContactRecord> for PreviousContactRecord {
+    fn from(contact: ContactRecord) -> Self {
+        Self {
+            invitation_id: contact.invitation_id,
+            device_id: contact.device_id,
+            display_name: contact.display_name,
+            identity_public_key: contact.identity_public_key,
+            identity_fingerprint: contact.identity_fingerprint,
+            mls_key_package: contact.mls_key_package,
+            mailbox_onion: contact.mailbox_onion,
+            send_mailbox_token: contact.send_mailbox_token,
+            receive_mailbox_token: contact.receive_mailbox_token,
+            verified: contact.verified,
+        }
+    }
 }
 
 #[derive(Clone, Debug, SerdeSerialize, SerdeDeserialize)]
@@ -140,7 +192,7 @@ struct PreviousDeviceIdentitySnapshot {
     mls_signature_key: Vec<u8>,
     mls_storage: HashMap<Vec<u8>, Vec<u8>>,
     mls_key_package: Vec<u8>,
-    contacts: Vec<ContactRecord>,
+    contacts: Vec<PreviousContactRecord>,
     issued_invitations: Vec<IssuedInvitation>,
     sessions: Vec<RemoteSession>,
     remote_inbound_receipts: Vec<InboundReceipt>,
@@ -160,7 +212,7 @@ impl From<PreviousDeviceIdentitySnapshot> for DeviceIdentitySnapshot {
             mls_signature_key: previous.mls_signature_key,
             mls_storage: previous.mls_storage,
             mls_key_package: previous.mls_key_package,
-            contacts: previous.contacts,
+            contacts: previous.contacts.into_iter().map(Into::into).collect(),
             issued_invitations: previous.issued_invitations,
             sessions: previous.sessions,
             remote_inbound_receipts: previous.remote_inbound_receipts,
@@ -184,7 +236,7 @@ struct LegacyDeviceIdentitySnapshot {
     mls_signature_key: Vec<u8>,
     mls_storage: HashMap<Vec<u8>, Vec<u8>>,
     mls_key_package: Vec<u8>,
-    contacts: Vec<ContactRecord>,
+    contacts: Vec<PreviousContactRecord>,
     issued_invitations: Vec<IssuedInvitation>,
     #[serde(default)]
     sessions: Vec<RemoteSession>,
@@ -204,7 +256,7 @@ struct OriginalDeviceIdentitySnapshot {
     mls_signature_key: Vec<u8>,
     mls_storage: HashMap<Vec<u8>, Vec<u8>>,
     mls_key_package: Vec<u8>,
-    contacts: Vec<ContactRecord>,
+    contacts: Vec<PreviousContactRecord>,
     issued_invitations: Vec<IssuedInvitation>,
 }
 
@@ -219,7 +271,7 @@ impl From<LegacyDeviceIdentitySnapshot> for DeviceIdentitySnapshot {
             mls_signature_key: legacy.mls_signature_key,
             mls_storage: legacy.mls_storage,
             mls_key_package: legacy.mls_key_package,
-            contacts: legacy.contacts,
+            contacts: legacy.contacts.into_iter().map(Into::into).collect(),
             issued_invitations: legacy.issued_invitations,
             sessions: legacy.sessions,
             remote_inbound_receipts: legacy.remote_inbound_receipts,
@@ -531,6 +583,7 @@ impl DeviceIdentity {
             send_mailbox_token: payload.inviter_receive_token,
             receive_mailbox_token: payload.invitee_receive_token,
             verified: false,
+            meshtastic_node_id: None,
         })
     }
 
@@ -562,6 +615,24 @@ impl DeviceIdentity {
             .find(|contact| contact.device_id == device_id)
             .ok_or_else(|| anyhow::anyhow!("contact does not exist"))?;
         contact.verified = true;
+        Ok(())
+    }
+
+    pub fn set_contact_meshtastic_node(
+        &mut self,
+        device_id: Uuid,
+        node_id: Option<u32>,
+    ) -> Result<()> {
+        let contact = self
+            .snapshot
+            .contacts
+            .iter_mut()
+            .find(|contact| contact.device_id == device_id)
+            .ok_or_else(|| anyhow::anyhow!("contact does not exist"))?;
+        if !contact.verified {
+            bail!("contact fingerprint must be verified before binding a Meshtastic node");
+        }
+        contact.meshtastic_node_id = node_id;
         Ok(())
     }
 
@@ -719,6 +790,7 @@ impl DeviceIdentity {
             send_mailbox_token: issued.invitee_receive_token,
             receive_mailbox_token: issued.inviter_receive_token,
             verified: false,
+            meshtastic_node_id: None,
         };
         self.snapshot.mls_storage = clone_storage(&provider)?;
         self.snapshot.sessions.push(RemoteSession {
@@ -1836,7 +1908,13 @@ mod tests {
             mls_signature_key: identity.snapshot.mls_signature_key.clone(),
             mls_storage: identity.snapshot.mls_storage.clone(),
             mls_key_package: identity.snapshot.mls_key_package.clone(),
-            contacts: identity.snapshot.contacts.clone(),
+            contacts: identity
+                .snapshot
+                .contacts
+                .clone()
+                .into_iter()
+                .map(Into::into)
+                .collect(),
             issued_invitations: identity.snapshot.issued_invitations.clone(),
         };
         let encoded = postcard::to_allocvec(&legacy).unwrap();
@@ -1895,12 +1973,15 @@ mod tests {
         let contact = bob.import_invitation(&invitation).unwrap();
         assert!(bob.import_invitation(&invitation).is_err());
         bob.mark_contact_verified(contact.device_id).unwrap();
+        bob.set_contact_meshtastic_node(contact.device_id, Some(0xa1b2c3d4))
+            .unwrap();
         bob.save_encrypted(&path, b"strong local password").unwrap();
 
         let restored = DeviceIdentity::load_encrypted(&path, b"strong local password").unwrap();
         assert_eq!(restored.contacts().len(), 1);
         assert!(restored.contacts()[0].verified);
         assert_eq!(restored.contacts()[0].device_id, alice.device_id());
+        assert_eq!(restored.contacts()[0].meshtastic_node_id, Some(0xa1b2c3d4));
     }
 
     #[test]

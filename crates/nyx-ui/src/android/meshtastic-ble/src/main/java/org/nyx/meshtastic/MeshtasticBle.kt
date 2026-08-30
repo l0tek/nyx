@@ -12,12 +12,14 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.os.Build
+import android.util.Base64
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
 class MeshtasticBle(private val activity: Activity) {
     companion object {
         private val SERVICE = UUID.fromString("6ba1b218-15a8-461f-9fa8-5dcae273eafd")
+        private val TO_RADIO = UUID.fromString("f75c76d2-129e-4dad-a1dd-7866124401e7")
         private val devices = ConcurrentHashMap<String, String>()
         @Volatile private var state = "DISCONNECTED"
         @Volatile private var gatt: BluetoothGatt? = null
@@ -44,6 +46,20 @@ class MeshtasticBle(private val activity: Activity) {
                 "CONNECTED: Meshtastic BLE"
             } else {
                 "ERROR: Gerät bietet keinen Meshtastic-Dienst an"
+            }
+        }
+
+        override fun onCharacteristicWrite(
+            g: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            status: Int
+        ) {
+            if (characteristic.uuid == TO_RADIO) {
+                state = if (status == BluetoothGatt.GATT_SUCCESS) {
+                    "CONNECTED: Meshtastic BLE · Testpaket geschrieben"
+                } else {
+                    "ERROR: Meshtastic BLE-Schreibfehler $status"
+                }
             }
         }
     }
@@ -149,6 +165,36 @@ class MeshtasticBle(private val activity: Activity) {
     }
 
     fun status(): String = state
+
+    fun sendToRadio(encoded: String): String {
+        if (!ensurePermissions()) return "ERROR: Bluetooth-Berechtigung fehlt"
+        val connection = gatt ?: return "ERROR: Kein Meshtastic-Gerät verbunden"
+        val characteristic = connection.getService(SERVICE)?.getCharacteristic(TO_RADIO)
+            ?: return "ERROR: Meshtastic-ToRadio-Charakteristik fehlt"
+        val payload = try {
+            Base64.decode(encoded, Base64.DEFAULT)
+        } catch (_: IllegalArgumentException) {
+            return "ERROR: Ungültiges ToRadio-Paket"
+        }
+        characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+        val accepted = if (Build.VERSION.SDK_INT >= 33) {
+            connection.writeCharacteristic(
+                characteristic,
+                payload,
+                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+            ) == BluetoothStatusCodes.SUCCESS
+        } else {
+            @Suppress("DEPRECATION")
+            characteristic.value = payload
+            @Suppress("DEPRECATION")
+            connection.writeCharacteristic(characteristic)
+        }
+        return if (accepted) {
+            "QUEUED: Meshtastic-ToRadio-Testpaket"
+        } else {
+            "ERROR: Meshtastic BLE-Schreibvorgang wurde abgelehnt"
+        }
+    }
 
     fun disconnect(): String {
         gatt?.disconnect()

@@ -4947,6 +4947,7 @@ dependencies = [
 name = "nyx-ui"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "blake3",
  "dioxus",
  "dotenvy",

@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 struct FallbackCommand {
     id: Uuid,
+    destination: u32,
     ciphertext: Vec<u8>,
     result: oneshot::Sender<Result<bool, String>>,
 }
@@ -19,7 +20,11 @@ struct FallbackCommand {
 static FALLBACK_SENDER: OnceLock<Mutex<Option<mpsc::UnboundedSender<FallbackCommand>>>> =
     OnceLock::new();
 
-pub(super) async fn dispatch_fallback(id: Uuid, ciphertext: Vec<u8>) -> Result<bool, String> {
+pub(super) async fn dispatch_fallback(
+    id: Uuid,
+    destination: u32,
+    ciphertext: Vec<u8>,
+) -> Result<bool, String> {
     let sender = FALLBACK_SENDER
         .get_or_init(|| Mutex::new(None))
         .lock()
@@ -30,6 +35,7 @@ pub(super) async fn dispatch_fallback(id: Uuid, ciphertext: Vec<u8>) -> Result<b
     sender
         .send(FallbackCommand {
             id,
+            destination,
             ciphertext,
             result: result_tx,
         })
@@ -84,16 +90,6 @@ pub(super) async fn run_session(
     let mut battery = None::<u32>;
     let mut voltage = None::<f32>;
     let mut utilization = None::<f32>;
-    let destination = match meshtastic_destination() {
-        Ok(destination) => destination,
-        Err(error) => {
-            status.set(MeshtasticStatus {
-                connected: false,
-                detail: error,
-            });
-            return;
-        }
-    };
     let (fallback_tx, mut fallback_rx) = mpsc::unbounded_channel();
     if let Ok(mut sender) = FALLBACK_SENDER.get_or_init(|| Mutex::new(None)).lock() {
         *sender = Some(fallback_tx);
@@ -150,7 +146,7 @@ pub(super) async fn run_session(
                 } else if own_node.is_none() {
                     Err("Meshtastic node identity is not available yet".into())
                 } else {
-                    send_fallback_fragments(&mut api, own_node.unwrap_or_default(), destination, command.id, &command.ciphertext)
+                    send_fallback_fragments(&mut api, own_node.unwrap_or_default(), command.destination, command.id, &command.ciphertext)
                         .await
                         .map(|()| {
                             fallback_attempted.insert(command.id);
@@ -174,15 +170,6 @@ pub(super) async fn run_session(
     if let Ok(mut sender) = FALLBACK_SENDER.get_or_init(|| Mutex::new(None)).lock() {
         *sender = None;
     }
-}
-
-fn meshtastic_destination() -> Result<u32, String> {
-    let value = std::env::var("NYX_MESHTASTIC_DESTINATION")
-        .map_err(|_| "NYX_MESHTASTIC_DESTINATION is not configured")?;
-    let value = value.trim().trim_start_matches('!');
-    u32::from_str_radix(value, 16)
-        .or_else(|_| value.parse())
-        .map_err(|_| "NYX_MESHTASTIC_DESTINATION must be a node ID such as !a1b2c3d4".into())
 }
 
 async fn send_fallback_fragments(

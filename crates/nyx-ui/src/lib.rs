@@ -11,7 +11,12 @@ use std::{
 };
 use zeroize::{Zeroize, Zeroizing};
 
-#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "windows",
+    target_os = "macos",
+    target_os = "android"
+))]
 mod mesh_fragment;
 #[cfg(target_os = "android")]
 mod meshtastic_ble;
@@ -28,6 +33,9 @@ const CSS: &str = r#"
 * { box-sizing: border-box; }
 body { margin: 0; }
 button, input { font: inherit; }
+button { transition: transform 80ms ease, filter 80ms ease, box-shadow 120ms ease; touch-action: manipulation; }
+button:active:not(:disabled) { transform: scale(.96); filter: brightness(1.22); }
+button:focus-visible { outline: 2px solid #8dd39e; outline-offset: 2px; }
 .auth-shell { min-height: 100vh; display: grid; place-items: center; padding: 24px; background: radial-gradient(circle at top, #162331, #090d12 55%); }
 .auth-card { width: min(460px, 100%); padding: 34px; border: 1px solid #2a3540; border-radius: 20px; background: #10161df2; box-shadow: 0 24px 70px #0008; }
 .auth-card h1 { margin: 8px 0; font-size: 34px; letter-spacing: .12em; }
@@ -60,6 +68,7 @@ button, input { font: inherit; }
 .tool-actions { display: flex; gap: 8px; }
 .tool-actions button { color: #dbe7ef; background: #18232d; border: 1px solid #354553; border-radius: 8px; padding: 7px 10px; cursor: pointer; }
 .tool-status { color: #8fa0ad; font-size: 11px; margin-top: 6px; }
+.save-feedback { margin-top: 14px; padding: 11px 12px; color: #b9f3c6; background: #11291a; border: 1px solid #397a4a; border-radius: 9px; font-size: 12px; line-height: 1.45; }
 .main { padding: 34px; display: flex; flex-direction: column; align-items: center; }
 .panel { width: min(850px, 100%); display: grid; grid-template-rows: auto 1fr auto; min-height: calc(100vh - 68px); border: 1px solid #26303a; border-radius: 16px; overflow: hidden; background: #0e141b; }
 .header { padding: 20px 24px; border-bottom: 1px solid #26303a; display: flex; justify-content: space-between; align-items: center; }
@@ -170,6 +179,11 @@ struct MeshtasticStatus {
     detail: String,
 }
 
+#[derive(Default)]
+struct MeshtasticSettings {
+    port: String,
+}
+
 impl MeshtasticStatus {
     fn idle() -> Self {
         Self {
@@ -220,6 +234,7 @@ impl MailboxConnectionStatus {
 
 #[component]
 pub fn App() -> Element {
+    let initial_meshtastic = load_meshtastic_settings();
     // Development convenience only: production secrets belong in an encrypted
     // vault or service manager, not a dotenv file.
     let _ = dotenvy::dotenv();
@@ -237,6 +252,7 @@ pub fn App() -> Element {
     let mut invitation_output = use_signal(String::new);
     let mut invitation_input = use_signal(String::new);
     let mut contact_status = use_signal(|| None::<String>);
+    let mut meshtastic_contact_node = use_signal(String::new);
     let mut reconnect_confirm = use_signal(|| None::<uuid::Uuid>);
     let mut mobile_menu_open = use_signal(|| false);
     let mut app_view = use_signal(|| AppView::Status);
@@ -246,9 +262,10 @@ pub fn App() -> Element {
     let mut config_onion = use_signal(default_mailbox_onion);
     let mut config_status = use_signal(|| None::<String>);
     let mut meshtastic_ports = use_signal(Vec::<String>::new);
-    let mut meshtastic_port = use_signal(String::new);
+    let mut meshtastic_port = use_signal(|| initial_meshtastic.port);
     let meshtastic_status = use_signal(MeshtasticStatus::idle);
     let meshtastic_session = use_signal(|| 0_u64);
+    let mut meshtastic_test_status = use_signal(|| None::<String>);
     let mailbox_onion = use_signal(default_mailbox_onion);
     let mut startup_ready = use_signal(|| false);
     let mut startup_error = use_signal(|| None::<String>);
@@ -295,7 +312,13 @@ pub fn App() -> Element {
     });
     let transport_status = use_signal(MailboxConnectionStatus::initial);
     use_future(move || async move {
+        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+        let started = Instant::now();
         let result = initialize_local_storage();
+        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+        if let Some(remaining) = Duration::from_millis(900).checked_sub(started.elapsed()) {
+            tokio::time::sleep(remaining).await;
+        }
         match result {
             Ok(queue) => {
                 delivery_queue.set(Ok(queue));
@@ -473,7 +496,7 @@ pub fn App() -> Element {
                             onclick: {
                                 let contact = contact.clone();
                                 move |_| {
-                                    select_contact(&contact, &mut selected_contact, recipient_mailbox_token, local_mailbox_token);
+                                    select_contact(&contact, &mut selected_contact, recipient_mailbox_token, local_mailbox_token, &mut meshtastic_contact_node);
                                     navigate_to(&mut app_view, AppView::Chat, &mut back_history, &mut forward_history);
                                 }
                             },
@@ -522,7 +545,7 @@ pub fn App() -> Element {
                                 onclick: {
                                     let contact = contact.clone();
                                     move |_| {
-                                        select_contact(&contact, &mut selected_contact, recipient_mailbox_token, local_mailbox_token);
+                                        select_contact(&contact, &mut selected_contact, recipient_mailbox_token, local_mailbox_token, &mut meshtastic_contact_node);
                                         mobile_menu_open.set(false);
                                         navigate_to(&mut app_view, AppView::Chat, &mut back_history, &mut forward_history);
                                     }
@@ -549,6 +572,36 @@ pub fn App() -> Element {
                                 strong { if meshtastic_status.read().connected { "Meshtastic verbunden" } else { "Meshtastic nicht verbunden" } }
                             }
                             p { class: "transport-state", "{meshtastic_status.read().detail}" }
+                            if let Some(contact) = active_contact.as_ref() {
+                                p { class: "transport-endpoint",
+                                    "Testkontakt: {contact.display_name} · ",
+                                    {contact.meshtastic_node_id.map(|node| format!("!{node:08x}")).unwrap_or_else(|| "keine Node-ID".into())}
+                                }
+                                button {
+                                    class: "mini-button",
+                                    disabled: !meshtastic_status.read().connected || contact.meshtastic_node_id.is_none(),
+                                    onclick: {
+                                        let contact = contact.clone();
+                                        move |_| {
+                                            meshtastic_test_status.set(Some("Meshtastic-Test wird gesendet …".into()));
+                                            let contact = contact.clone();
+                                            spawn(async move {
+                                                let message = match send_meshtastic_test(&contact).await {
+                                                    Ok(()) => format!("Meshtastic-Test an {} gesendet", contact.meshtastic_node_id.map(|node| format!("!{node:08x}")).unwrap_or_default()),
+                                                    Err(error) => format!("Meshtastic-Test fehlgeschlagen: {error}"),
+                                                };
+                                                meshtastic_test_status.set(Some(message));
+                                            });
+                                        }
+                                    },
+                                    "Test an Kontakt senden"
+                                }
+                            } else {
+                                p { class: "transport-endpoint", "Für einen Test zuerst einen importierten Kontakt auswählen." }
+                            }
+                            if let Some(test_status) = meshtastic_test_status.read().as_ref() {
+                                p { class: "transport-state", "{test_status}" }
+                            }
                             if !meshtastic_port.read().trim().is_empty() {
                                 p { class: "transport-endpoint", if cfg!(target_os = "android") { "Bluetooth: {meshtastic_port}" } else { "USB: {meshtastic_port}" } }
                             }
@@ -593,7 +646,7 @@ pub fn App() -> Element {
                             }
                         }
                         if let Some(status) = config_status.read().as_ref() {
-                            div { class: "tool-status", "{status}" }
+                            div { class: "save-feedback", role: "status", aria_live: "polite", "{status}" }
                         }
                         div { class: "transport",
                             div { class: "eyebrow", "Meshtastic" }
@@ -647,7 +700,7 @@ pub fn App() -> Element {
                             }
                         }
                         div { class: "config-actions",
-                            button { class: "primary", onclick: move |_| save_configuration(&mut identity, autosave_password, &config_name, &config_onion, mailbox_onion, &mut config_status), "Save" }
+                            button { class: "primary", onclick: move |_| save_configuration(&mut identity, autosave_password, &config_name, &config_onion, mailbox_onion, &mut config_status), "Einstellungen speichern" }
                         }
                     }
                 } else if *app_view.read() == AppView::ContactExport {
@@ -706,6 +759,38 @@ pub fn App() -> Element {
                                 h3 { "{contact.display_name}" }
                                 p { "Kontakt importiert. Vergleiche diesen Fingerprint über einen zweiten, vertrauenswürdigen Kanal mit deinem Kontakt:" }
                                 div { class: "fingerprint", "{contact.identity_fingerprint}" }
+                                if contact.verified {
+                                    div { class: "field", key: "mesh-{contact.device_id}",
+                                        label { "Meshtastic-Node-ID" }
+                                        input {
+                                            value: "{meshtastic_contact_node}",
+                                            placeholder: "!a1b2c3d4",
+                                            oninput: move |event| meshtastic_contact_node.set(event.value())
+                                        }
+                                    }
+                                    button {
+                                        class: "mini-button",
+                                        disabled: meshtastic_contact_node.read().trim().is_empty(),
+                                        onclick: {
+                                            let device_id = contact.device_id;
+                                            move |_| save_contact_meshtastic_node(&mut identity, device_id, meshtastic_contact_node.read().as_str(), autosave_password, &mut contact_status)
+                                        },
+                                        "Node-ID im Kontakt speichern"
+                                    }
+                                    if contact.meshtastic_node_id.is_some() {
+                                        button {
+                                            class: "mini-button",
+                                            onclick: {
+                                                let device_id = contact.device_id;
+                                                move |_| {
+                                                    save_contact_meshtastic_node(&mut identity, device_id, "", autosave_password, &mut contact_status);
+                                                    meshtastic_contact_node.set(String::new());
+                                                }
+                                            },
+                                            "Node-ID entfernen"
+                                        }
+                                    }
+                                }
                                 p { if remote_session_ready { "Die verschlüsselte MLS-Verbindung ist bereit." } else if contact.verified { "Fingerprint bestätigt. Nimm jetzt die Einladung an, um die verschlüsselte Verbindung aufzubauen." } else { "Wenn beide Fingerprints übereinstimmen, bestätige den Vergleich mit dem Button." } }
                                 if !contact.verified {
                                     button {
@@ -894,6 +979,13 @@ fn connect_meshtastic_usb(
     mut status: Signal<MeshtasticStatus>,
     mut session: Signal<u64>,
 ) {
+    if let Err(error) = save_meshtastic_settings(&port) {
+        status.set(MeshtasticStatus {
+            connected: false,
+            detail: error,
+        });
+        return;
+    }
     let id = session().wrapping_add(1);
     session.set(id);
     status.set(MeshtasticStatus {
@@ -909,6 +1001,13 @@ fn connect_meshtastic_usb(
     mut status: Signal<MeshtasticStatus>,
     mut session: Signal<u64>,
 ) {
+    if let Err(error) = save_meshtastic_settings(&port) {
+        status.set(MeshtasticStatus {
+            connected: false,
+            detail: error,
+        });
+        return;
+    }
     let id = session().wrapping_add(1);
     session.set(id);
     match meshtastic_ble::connect_device(&port) {
@@ -958,6 +1057,41 @@ fn delivery_queue_path() -> PathBuf {
     std::env::var_os("NYX_DELIVERY_QUEUE_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|| app_data_path("nyx-delivery.sqlite3"))
+}
+
+fn meshtastic_settings_path() -> PathBuf {
+    app_data_path("nyx-meshtastic-settings")
+}
+
+fn load_meshtastic_settings() -> MeshtasticSettings {
+    let Ok(port) = std::fs::read_to_string(meshtastic_settings_path()) else {
+        return MeshtasticSettings::default();
+    };
+    let port = port.trim().to_owned();
+    if port.is_empty() || port.len() > 512 || port.contains(['\r', '\n']) {
+        MeshtasticSettings::default()
+    } else {
+        MeshtasticSettings { port }
+    }
+}
+
+fn save_meshtastic_settings(port: &str) -> Result<(), String> {
+    let port = port.trim();
+    if port.is_empty() || port.len() > 512 || port.contains(['\r', '\n']) {
+        return Err("Meshtastic-Geräteadresse ist ungültig".into());
+    }
+    let path = meshtastic_settings_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            format!("Meshtastic-Einstellungen können nicht gespeichert werden: {error}")
+        })?;
+    }
+    let temporary = path.with_extension("tmp");
+    std::fs::write(&temporary, port.as_bytes()).map_err(|error| {
+        format!("Meshtastic-Einstellungen können nicht gespeichert werden: {error}")
+    })?;
+    std::fs::rename(&temporary, &path)
+        .map_err(|error| format!("Meshtastic-Einstellungen können nicht aktiviert werden: {error}"))
 }
 
 fn initialize_local_storage() -> Result<DeliveryQueue, String> {
@@ -1102,7 +1236,7 @@ async fn run_delivery_worker(
         let transport = match TorTransport::bootstrap_in(app_data_path("arti-client")).await {
             Ok(transport) => transport,
             Err(error) => {
-                let fallback = attempt_meshtastic_fallback(&queue).await;
+                let fallback = attempt_meshtastic_fallback(&queue, identity).await;
                 update_connection_status(
                     &mut status,
                     ConnectionPhase::Degraded,
@@ -1118,7 +1252,8 @@ async fn run_delivery_worker(
                     Some(endpoint.host.clone()),
                     false,
                 );
-                tokio::time::sleep(Duration::from_secs(15)).await;
+                wait_for_mailbox_change(mailbox_onion, &endpoint.host, Duration::from_secs(15))
+                    .await;
                 continue;
             }
         };
@@ -1143,7 +1278,12 @@ async fn run_delivery_worker(
                             None,
                             false,
                         );
-                        tokio::time::sleep(Duration::from_secs(10)).await;
+                        wait_for_mailbox_change(
+                            mailbox_onion,
+                            &endpoint.host,
+                            Duration::from_secs(10),
+                        )
+                        .await;
                         continue;
                     }
                 }
@@ -1162,7 +1302,7 @@ async fn run_delivery_worker(
                     true,
                 ),
                 Err(error) => {
-                    let fallback = attempt_meshtastic_fallback(&queue).await;
+                    let fallback = attempt_meshtastic_fallback(&queue, identity).await;
                     update_connection_status(
                         &mut status,
                         ConnectionPhase::Degraded,
@@ -1178,7 +1318,8 @@ async fn run_delivery_worker(
                         Some(endpoint.host.clone()),
                         false,
                     );
-                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    wait_for_mailbox_change(mailbox_onion, &endpoint.host, Duration::from_secs(10))
+                        .await;
                     continue;
                 }
             }
@@ -1235,7 +1376,7 @@ async fn run_delivery_worker(
                     ),
                 ),
                 Err(error) => {
-                    let fallback = attempt_meshtastic_fallback(&queue).await;
+                    let fallback = attempt_meshtastic_fallback(&queue, identity).await;
                     update_connection_detail(
                         &mut status,
                         match fallback {
@@ -1430,24 +1571,116 @@ async fn run_delivery_worker(
                     ),
                 }
             }
-            tokio::time::sleep(Duration::from_secs(10)).await;
+            wait_for_mailbox_change(mailbox_onion, &endpoint.host, Duration::from_secs(10)).await;
+        }
+    }
+}
+
+async fn wait_for_mailbox_change(
+    mailbox_onion: Signal<String>,
+    current_host: &str,
+    maximum: Duration,
+) {
+    let started = Instant::now();
+    while started.elapsed() < maximum {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if mailbox_onion.read().trim() != current_host {
+            return;
         }
     }
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-async fn attempt_meshtastic_fallback(queue: &DeliveryQueue) -> Result<usize, String> {
+async fn attempt_meshtastic_fallback(
+    queue: &DeliveryQueue,
+    identity: Signal<Result<Option<DeviceIdentity>, String>>,
+) -> Result<usize, String> {
+    let destinations = identity
+        .read()
+        .as_ref()
+        .ok()
+        .and_then(Option::as_ref)
+        .map(|device| {
+            device
+                .contacts()
+                .iter()
+                .filter_map(|contact| {
+                    contact
+                        .meshtastic_node_id
+                        .map(|node| (contact.send_mailbox_token, node))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     let mut dispatched = 0;
     for item in queue.pending(8).map_err(|error| error.to_string())? {
-        if meshtastic_usb::dispatch_fallback(item.id, item.envelope.ciphertext).await? {
+        let Some((_, destination)) = destinations
+            .iter()
+            .find(|(token, _)| token == &item.envelope.mailbox_token)
+        else {
+            continue;
+        };
+        if meshtastic_usb::dispatch_fallback(item.id, *destination, item.envelope.ciphertext)
+            .await?
+        {
             dispatched += 1;
         }
     }
     Ok(dispatched)
 }
 
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+async fn send_meshtastic_test(contact: &ContactRecord) -> Result<(), String> {
+    let destination = contact
+        .meshtastic_node_id
+        .ok_or_else(|| "Im Kontakt ist keine Meshtastic-Node-ID gespeichert".to_owned())?;
+    let id = uuid::Uuid::new_v4();
+    meshtastic_usb::dispatch_fallback(id, destination, b"NYX Meshtastic send test".to_vec())
+        .await?
+        .then_some(())
+        .ok_or_else(|| "Testpaket wurde in dieser Sitzung bereits gesendet".to_owned())
+}
+
 #[cfg(target_os = "android")]
-async fn attempt_meshtastic_fallback(_queue: &DeliveryQueue) -> Result<usize, String> {
+async fn send_meshtastic_test(contact: &ContactRecord) -> Result<(), String> {
+    use meshtastic::Message;
+    use meshtastic::protobufs::{Data, MeshPacket, PortNum, ToRadio};
+
+    let destination = contact
+        .meshtastic_node_id
+        .ok_or_else(|| "Im Kontakt ist keine Meshtastic-Node-ID gespeichert".to_owned())?;
+    let id = uuid::Uuid::new_v4();
+    let fragment = mesh_fragment::fragment(id, b"NYX Meshtastic send test")?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "Meshtastic-Testfragment fehlt".to_owned())?;
+    let packet_id = u32::from_le_bytes(id.as_bytes()[..4].try_into().unwrap());
+    let packet = MeshPacket {
+        to: destination,
+        id: packet_id,
+        want_ack: true,
+        payload_variant: Some(meshtastic::protobufs::mesh_packet::PayloadVariant::Decoded(
+            Data {
+                portnum: PortNum::PrivateApp as i32,
+                payload: fragment,
+                ..Default::default()
+            },
+        )),
+        ..Default::default()
+    };
+    let to_radio = ToRadio {
+        payload_variant: Some(meshtastic::protobufs::to_radio::PayloadVariant::Packet(
+            packet,
+        )),
+    };
+    meshtastic_ble::send_to_radio(&to_radio.encode_to_vec())
+}
+
+#[cfg(target_os = "android")]
+async fn attempt_meshtastic_fallback(
+    _queue: &DeliveryQueue,
+    _identity: Signal<Result<Option<DeviceIdentity>, String>>,
+) -> Result<usize, String> {
     Err("Android BLE fallback data transport is not available yet".into())
 }
 
@@ -1630,6 +1863,7 @@ fn save_configuration(
     mut mailbox_onion: Signal<String>,
     status: &mut Signal<Option<String>>,
 ) {
+    trigger_haptic_feedback();
     let result = (|| -> Result<String, String> {
         let mut state = identity.write();
         let device = state
@@ -1647,12 +1881,12 @@ fn save_configuration(
     })();
     match result {
         Ok(address) => {
-            mailbox_onion.set(address);
-            status.set(Some(
-                "Configuration saved in the encrypted device identity".into(),
-            ));
+            mailbox_onion.set(address.clone());
+            status.set(Some(format!(
+                "Gespeichert. Die Mailbox wird jetzt neu kontaktiert: {address}"
+            )));
         }
-        Err(error) => status.set(Some(format!("Configuration rejected: {error}"))),
+        Err(error) => status.set(Some(format!("Speichern fehlgeschlagen: {error}"))),
     }
 }
 
@@ -1664,6 +1898,7 @@ fn change_mailbox(
     mut mailbox_onion: Signal<String>,
     status: &mut Signal<Option<String>>,
 ) {
+    trigger_haptic_feedback();
     let result = (|| -> Result<String, String> {
         let mut state = identity.write();
         let device = state
@@ -1685,11 +1920,17 @@ fn change_mailbox(
     })();
     match result {
         Ok(address) => {
-            mailbox_onion.set(address);
-            status.set(Some("Mailbox configuration saved".into()));
+            mailbox_onion.set(address.clone());
+            status.set(Some(format!(
+                "Mailbox gespeichert und wird jetzt kontaktiert: {address}"
+            )));
         }
-        Err(error) => status.set(Some(format!("Mailbox change rejected: {error}"))),
+        Err(error) => status.set(Some(format!("Mailbox-Änderung fehlgeschlagen: {error}"))),
     }
+}
+
+fn trigger_haptic_feedback() {
+    let _ = dioxus::document::eval("if (navigator.vibrate) { navigator.vibrate(18); }");
 }
 
 fn qr_svg(payload: &str) -> Result<String, String> {
@@ -1851,12 +2092,19 @@ fn select_contact(
     selected_contact: &mut Signal<Option<uuid::Uuid>>,
     mut recipient_token: Signal<Option<[u8; 32]>>,
     mut local_token: Signal<Vec<[u8; 32]>>,
+    meshtastic_contact_node: &mut Signal<String>,
 ) {
     selected_contact.set(Some(contact.device_id));
     recipient_token.set(Some(contact.send_mailbox_token));
     let mut receive_tokens = local_token.read().clone();
     add_receive_token(&mut receive_tokens, contact.receive_mailbox_token);
     local_token.set(receive_tokens);
+    meshtastic_contact_node.set(
+        contact
+            .meshtastic_node_id
+            .map(|node| format!("!{node:08x}"))
+            .unwrap_or_default(),
+    );
 }
 
 fn add_receive_token(tokens: &mut Vec<[u8; 32]>, token: [u8; 32]) {
@@ -1935,6 +2183,44 @@ fn verify_contact_fingerprint(
         Ok(()) => status.set(Some("Contact fingerprint marked as verified".into())),
         Err(error) => status.set(Some(format!("Verification update failed: {error}"))),
     }
+}
+
+fn save_contact_meshtastic_node(
+    identity: &mut Signal<Result<Option<DeviceIdentity>, String>>,
+    device_id: uuid::Uuid,
+    value: &str,
+    autosave_password: Signal<Zeroizing<Vec<u8>>>,
+    status: &mut Signal<Option<String>>,
+) {
+    let result = (|| -> Result<Option<u32>, String> {
+        let value = value.trim();
+        let node_id = if value.is_empty() {
+            None
+        } else {
+            let value = value.trim_start_matches('!');
+            Some(u32::from_str_radix(value, 16).map_err(|_| {
+                "Node-ID muss hexadezimal angegeben werden, z. B. !a1b2c3d4".to_owned()
+            })?)
+        };
+        let mut state = identity.write();
+        let device = state
+            .as_mut()
+            .map_err(|error| error.clone())?
+            .as_mut()
+            .ok_or_else(|| "Device is locked".to_owned())?;
+        device
+            .set_contact_meshtastic_node(device_id, node_id)
+            .map_err(|error| error.to_string())?;
+        device
+            .save_encrypted(identity_path(), autosave_password.read().as_slice())
+            .map_err(|error| error.to_string())?;
+        Ok(node_id)
+    })();
+    status.set(Some(match result {
+        Ok(Some(node)) => format!("Meshtastic-Node !{node:08x} wurde im Kontakt gespeichert"),
+        Ok(None) => "Meshtastic-Node wurde aus dem Kontakt entfernt".into(),
+        Err(error) => format!("Meshtastic-Node konnte nicht gespeichert werden: {error}"),
+    }));
 }
 
 fn accept_contact_invitation(

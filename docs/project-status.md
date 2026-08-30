@@ -43,19 +43,26 @@ not suitable for sensitive or production communication.
   device from a drop-down or accept a manually entered port/address, connect,
   disconnect, and report connection errors. The main status screen always shows
   Meshtastic state and links directly to its setup.
+- The selected Meshtastic USB port or BLE address is persisted locally and
+  restored on the next client start. Desktop shows a bounded startup progress
+  screen while its local stores are prepared.
 - A configured desktop radio reports the local Meshtastic node ID, node name,
   hardware model, NodeDB size, battery, voltage, channel utilization, firmware
   environment, selected port, and observed PhoneAPI packet count when supplied
   by the firmware.
 - Outbound delivery now follows a Tor-first policy. Only after Tor bootstrap,
   Onion health, or mailbox deposit fails does the worker offer pending, already
-  MLS-encrypted client payloads to an active Meshtastic USB session. The target
-  is the hexadecimal node ID in `NYX_MESHTASTIC_DESTINATION`.
+  MLS-encrypted client payloads to an active Meshtastic USB session. A verified
+  contact can store an optional hexadecimal Meshtastic node ID; queued payloads
+  are routed by the contact's mailbox capability to that per-contact node.
 - The experimental Meshtastic fallback uses `PRIVATE_APP`, unicast packets and
   per-fragment `want_ack`. A versioned `NYXM` envelope carries the stable queue
   UUID, fragment index/count, and a truncated BLAKE3 whole-message digest.
   Payloads are split below Meshtastic's 233-byte application limit and capped at
   16 KiB. Unit tests verify bounds, stable identity, and invalid-size rejection.
+- The status screen can send a `PRIVATE_APP` test packet to the Meshtastic node
+  stored on the selected verified contact. Desktop uses USB StreamAPI; Android
+  encodes `ToRadio` and writes it to the official GATT characteristic.
 - Dispatching fragments to a radio deliberately does not mark the durable Tor
   queue item delivered. A radio ACK is not proof that the peer reassembled and
   committed the MLS message. Tor therefore remains eligible to retry, while MLS
@@ -78,6 +85,9 @@ not suitable for sensitive or production communication.
 - Configuration is available from the Dioxus menu. The bundled default mailbox
   Onion address is shown there and can be edited; additional mailbox entries can
   be added, selected, changed, and persisted locally on desktop and Android.
+- Saving configuration provides pressed-state/haptic feedback and a visible
+  result. Changing the active Onion address interrupts the polling delay within
+  100 ms and immediately checks the newly selected mailbox.
 - Contact invitations are URL-safe Base64/Postcard objects signed over all
   fields. Import verifies the Ed25519 signature, timestamps, v3 Onion syntax,
   MLS KeyPackage signature/lifetime/ciphersuite, duplicate device IDs, and size
@@ -205,12 +215,17 @@ not suitable for sensitive or production communication.
 - The live-Tor smoke test is manual and has not been automated in CI. There are
   no parser fuzz tests, load tests, backup/restore procedures, deployment
   manifests, or monitoring.
+- The mailbox server supports deliberate Onion identity reinitialization with
+  `--reinitialize-onion-identity` or
+  `NYX_MAILBOX_REINITIALIZE_ONION_IDENTITY=1`. The old Arti state is renamed to
+  a timestamped backup while `mailbox.sqlite3` is preserved; operators must
+  then update the expected address and all clients.
 - Android QR scanning depends on camera permission and the system WebView's
   `BarcodeDetector` QR support. Device-level camera scanning and Tor bootstrap
   still require acceptance testing on representative Android versions.
 - Meshtastic inbound `NYXM` reassembly, end-to-end fallback receipts, selective
   missing-fragment retransmission, durable fragment state, Android BLE payload
-  transfer, and automatic peer-node binding to a verified Nyx contact are not
+  transfer, and authenticated automatic peer-node discovery are not
   implemented. Until those pieces exist, the current Tor-first Meshtastic path
   is an experimental outbound dispatch mechanism, not a complete alternative
   delivery channel. Initial MLS Welcome/KeyPackage transfer and large files
@@ -298,7 +313,7 @@ export NYX_MAILBOX_ONION="<v3-address>.onion"
 export NYX_MAILBOX_PORT="443"
 export NYX_RECIPIENT_MAILBOX_TOKEN_HEX="<64 hexadecimal characters>"
 export NYX_LOCAL_MAILBOX_TOKEN_HEX="<64 hexadecimal characters>"
-export NYX_MESHTASTIC_DESTINATION="!a1b2c3d4"
+# Store !a1b2c3d4 on the verified contact in the Nyx contact view.
 cd apps/desktop
 dx serve --desktop
 ```

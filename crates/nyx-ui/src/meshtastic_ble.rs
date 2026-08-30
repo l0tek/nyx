@@ -1,4 +1,5 @@
 use super::MeshtasticStatus;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use dioxus::prelude::*;
 use jni::objects::{JClass, JString, JValue};
 use std::time::Duration;
@@ -83,6 +84,15 @@ pub(super) fn connect_device(selection: &str) -> Result<String, String> {
 
 pub(super) fn disconnect_device() -> Result<String, String> {
     call_plugin("disconnect", None)
+}
+
+pub(super) fn send_to_radio(packet: &[u8]) -> Result<(), String> {
+    let result = call_plugin("sendToRadio", Some(&STANDARD.encode(packet)))?;
+    if let Some(error) = result.strip_prefix("ERROR: ") {
+        Err(error.to_owned())
+    } else {
+        Ok(())
+    }
 }
 
 pub(super) async fn monitor(id: u64, mut state: Signal<MeshtasticStatus>, session: Signal<u64>) {

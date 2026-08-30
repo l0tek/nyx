@@ -464,13 +464,10 @@ Der aktuelle Versand folgt einer Tor-first-Strategie:
 4. Erst bei einem Fehler werden noch ausstehende, bereits MLS-verschlüsselte
    Nutzlasten einer aktiven Desktop-USB-Meshtastic-Sitzung angeboten.
 
-Der Zielknoten wird konfiguriert mit:
-
-```bash
-NYX_MESHTASTIC_DESTINATION=!a1b2c3d4
-```
-
-Das Ziel muss eine hexadezimale Meshtastic-Node-ID sein.
+Der Zielknoten wird im jeweiligen verifizierten Nyx-Kontakt gespeichert. Die
+Node-ID muss hexadezimal angegeben werden, beispielsweise `!a1b2c3d4`. Nyx
+ordnet wartende Nachrichten anhand der kontaktbezogenen Mailbox-Fähigkeit dem
+richtigen Funkziel zu.
 
 ### Funkfragmentierung
 
@@ -501,7 +498,7 @@ Noch nicht implementiert sind:
 - selektive Wiederholung fehlender Fragmente;
 - persistenter Fragmentzustand;
 - Nutzlastversand über Android-BLE;
-- sichere Zuordnung einer Node-ID zu einem verifizierten Nyx-Kontakt;
+- authentifizierte automatische Erkennung der Node-ID eines Kontakts;
 - Übertragung initialer MLS-Welcome-/KeyPackage-Daten über Funk;
 - große Dateien oder Anhänge.
 
@@ -525,6 +522,18 @@ Server starten:
 ```bash
 cargo run -p nyx-mailbox-server
 ```
+
+Onion-Identität bewusst neu initialisieren:
+
+```bash
+cargo run -p nyx-mailbox-server -- --reinitialize-onion-identity
+```
+
+Der Schalter verschiebt den bisherigen `arti-state` in ein datiertes
+`arti-state.backup-*`-Verzeichnis und erzeugt eine neue Onion-Adresse. Die
+`mailbox.sqlite3` mit wartenden Nachrichten bleibt erhalten. Anschließend
+müssen `NYX_MAILBOX_EXPECTED_ONION` und alle Clients auf die im Serverlog
+ausgegebene neue Adresse aktualisiert werden.
 
 Beim Start bootstrapt Arti Tor und lädt die persistente Onion-Identität. Der
 Server verweigert den Start, wenn die erzeugte Adresse nicht mit
@@ -586,11 +595,11 @@ echten Nachrichteninhalte. Der Test ist manuell und derzeit nicht Teil der CI.
 | `NYX_MAILBOX_DATA_DIR` | Serverdaten, Standard `nyx-mailbox-data` |
 | `NYX_MAILBOX_ARTI_STATE_DIR` | persistenter Arti-Zustand und Onion-Identität |
 | `NYX_MAILBOX_ARTI_CACHE_DIR` | Arti-Cache |
+| `NYX_MAILBOX_REINITIALIZE_ONION_IDENTITY` | `1`/`true`: Onion-Identität beim nächsten Serverstart sichern und neu erzeugen |
 | `NYX_DESKTOP_STATE_PATH` | verschlüsselter MLS-Zustand |
 | `NYX_DEVICE_IDENTITY_PATH` | verschlüsselte Geräteidentität |
 | `NYX_DELIVERY_QUEUE_PATH` | lokale SQLite-Ciphertext-Warteschlange |
 | `NYX_VAULT_LOCK_TIMEOUT_SECS` | Inaktivität bis zur Sperre, 30–86.400 Sekunden |
-| `NYX_MESHTASTIC_DESTINATION` | experimenteller Desktop-Fallback-Zielknoten |
 | `RUST_LOG` | optionale Rust-Protokollfilterung ohne Geheimdaten |
 
 Beispiel für lokale Entwicklung:
@@ -601,7 +610,7 @@ NYX_MAILBOX_PORT=443
 NYX_LOCAL_MAILBOX_TOKEN_HEX=<64-zufällige-hexzeichen>
 NYX_RECIPIENT_MAILBOX_TOKEN_HEX=<andere-64-zufällige-hexzeichen>
 NYX_VAULT_LOCK_TIMEOUT_SECS=300
-NYX_MESHTASTIC_DESTINATION=!a1b2c3d4
+# Die Meshtastic-Node-ID wird im verifizierten Kontakt gespeichert.
 ```
 
 Token niemals zwischen Sende- und Empfangsrichtung wiederverwenden oder in
