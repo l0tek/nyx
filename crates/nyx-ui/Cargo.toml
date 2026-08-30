@@ -29,3 +29,4 @@ manganis = "0.7.10"
 [target.'cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))'.dependencies]
 meshtastic = { version = "0.1.9", default-features = false, features = ["tokio"] }
 blake3.workspace = true
+dirs = "6"

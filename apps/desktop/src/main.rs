@@ -7,6 +7,7 @@ fn main() {
     file_menu
         .append_items(&[
             &muda::MenuItem::with_id(nyx_ui::CONFIG_MENU_ID, "Konfiguration", true, None),
+            &muda::MenuItem::with_id(nyx_ui::LOG_MENU_ID, "Log anzeigen", true, None),
             &muda::PredefinedMenuItem::separator(),
             &muda::PredefinedMenuItem::quit(Some("Nyx beenden")),
         ])

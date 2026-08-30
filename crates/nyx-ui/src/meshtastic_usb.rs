@@ -53,10 +53,16 @@ pub(super) async fn run_session(
     id: u64,
     mut status: Signal<MeshtasticStatus>,
     session: Signal<u64>,
+    mut own_node_signal: Signal<Option<u32>>,
 ) {
+    super::append_log("INFO", &format!("Öffne Meshtastic USB-Port {port}"));
     let serial = match utils::stream::build_serial_stream(port.clone(), None, None, None) {
         Ok(serial) => serial,
         Err(error) => {
+            super::append_log(
+                "ERROR",
+                &format!("USB-Port {port} konnte nicht geöffnet werden: {error}"),
+            );
             status.set(MeshtasticStatus {
                 connected: false,
                 detail: format!("{port} konnte nicht geöffnet werden: {error}"),
@@ -69,6 +75,10 @@ pub(super) async fn run_session(
     let mut api = match api.configure(utils::generate_rand_id()).await {
         Ok(api) => api,
         Err(error) => {
+            super::append_log(
+                "ERROR",
+                &format!("Meshtastic-Konfiguration über {port} fehlgeschlagen: {error}"),
+            );
             status.set(MeshtasticStatus {
                 connected: false,
                 detail: format!("Meshtastic-Konfiguration fehlgeschlagen: {error}"),
@@ -81,6 +91,7 @@ pub(super) async fn run_session(
         connected: true,
         detail: format!("Meshtastic über {port} verbunden · Konfiguration wird gelesen"),
     });
+    super::append_log("INFO", &format!("Meshtastic über {port} verbunden"));
     let mut packet_count = 0_u64;
     let mut node_count = None::<u32>;
     let mut own_node = None::<u32>;
@@ -99,13 +110,17 @@ pub(super) async fn run_session(
         tokio::select! {
             packet = packets.recv() => {
                 let Some(packet) = packet else {
+                    super::append_log("WARN", &format!("Meshtastic-Verbindung zu {port} wurde beendet"));
                     status.set(MeshtasticStatus { connected: false, detail: format!("Verbindung zu {port} wurde beendet") });
                     break;
                 };
                 packet_count += 1;
                 match packet.payload_variant {
                     Some(PayloadVariant::MyInfo(info)) => {
+                        super::append_log("INFO", &format!("Lokale Meshtastic-Node erkannt: !{:08x}", info.my_node_num));
                         own_node = Some(info.my_node_num);
+                        own_node_signal.set(own_node);
+                        let _ = super::save_meshtastic_settings(&port, own_node);
                         node_count = Some(info.nodedb_count);
                         if !info.pio_env.is_empty() { environment = Some(info.pio_env); }
                     }
@@ -156,7 +171,7 @@ pub(super) async fn run_session(
                 let _ = command.result.send(result);
             }
             _ = tokio::time::sleep(Duration::from_millis(200)) => {
-                if session() != id {
+                if *session.peek() != id {
                     let detail = match api.disconnect().await {
                         Ok(_) => "Meshtastic-Verbindung getrennt".to_owned(),
                         Err(error) => format!("Verbindung getrennt; Abschlussfehler: {error}"),

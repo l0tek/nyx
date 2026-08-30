@@ -31,7 +31,7 @@ const SNAPSHOT_VERSION: u16 = 3;
 const MAX_INBOUND_RECEIPTS: usize = 4096;
 const MAX_OUTBOUND_JOURNAL: usize = 1024;
 const DEVICE_SNAPSHOT_VERSION: u16 = 1;
-const INVITATION_VERSION: u16 = 1;
+const INVITATION_VERSION: u16 = 2;
 const MAX_DISPLAY_NAME_SIZE: usize = 64;
 const MAX_CONTACTS: usize = 1024;
 const INVITATION_LIFETIME_MS: i64 = 7 * 24 * 60 * 60 * 1000;
@@ -128,6 +128,7 @@ pub struct InvitationAcceptancePayload {
     pub accepter_identity_public_key: [u8; 32],
     pub accepter_mls_key_package: Vec<u8>,
     pub mailbox_onion: String,
+    pub meshtastic_node_id: Option<u32>,
     pub welcome: Vec<u8>,
 }
 
@@ -146,6 +147,7 @@ pub struct ContactInvitationPayload {
     pub inviter_identity_public_key: [u8; 32],
     pub mls_key_package: Vec<u8>,
     pub mailbox_onion: String,
+    pub meshtastic_node_id: Option<u32>,
     /// Recipient uses this token to send messages to the inviter.
     pub inviter_receive_token: [u8; 32],
     /// Recipient polls this token for messages sent by the inviter.
@@ -421,11 +423,24 @@ impl DeviceIdentity {
         if index >= self.snapshot.mailboxes.len() {
             bail!("mailbox does not exist");
         }
+        if self.snapshot.mailboxes.len() == 1 {
+            bail!("the last mailbox cannot be removed");
+        }
         let removed = self.snapshot.mailboxes.remove(index);
         if self.snapshot.mailbox_onion.as_deref() == Some(&removed) {
             self.snapshot.mailbox_onion = self.snapshot.mailboxes.first().cloned();
         }
         Ok(())
+    }
+
+    pub fn remove_mailbox_address(&mut self, address: &str) -> Result<()> {
+        let index = self
+            .snapshot
+            .mailboxes
+            .iter()
+            .position(|candidate| candidate == address)
+            .ok_or_else(|| anyhow::anyhow!("mailbox does not exist"))?;
+        self.remove_mailbox(index)
     }
 
     pub fn update_profile(
@@ -480,7 +495,19 @@ impl DeviceIdentity {
     }
 
     pub fn create_invitation(&mut self, mailbox_onion: impl Into<String>) -> Result<String> {
+        self.create_invitation_with_meshtastic_node(mailbox_onion, None)
+    }
+
+    pub fn create_invitation_with_meshtastic_node(
+        &mut self,
+        mailbox_onion: impl Into<String>,
+        meshtastic_node_id: Option<u32>,
+    ) -> Result<String> {
         let mailbox_onion = validate_onion_address(mailbox_onion.into())?;
+        // An MLS KeyPackage is single-use: processing a Welcome consumes its
+        // private init key. Reusing the device's original package for several
+        // invitations makes every later Welcome fail with NoMatchingKeyPackage.
+        self.rotate_invitation_key_package()?;
         let now = unix_time_ms()?;
         let mut inviter_receive_token = [0_u8; 32];
         let mut invitee_receive_token = [0_u8; 32];
@@ -494,6 +521,7 @@ impl DeviceIdentity {
             inviter_identity_public_key: self.snapshot.identity_public_key,
             mls_key_package: self.snapshot.mls_key_package.clone(),
             mailbox_onion,
+            meshtastic_node_id,
             inviter_receive_token,
             invitee_receive_token,
             created_unix_ms: now,
@@ -513,6 +541,24 @@ impl DeviceIdentity {
         });
         Ok(URL_SAFE_NO_PAD
             .encode(postcard::to_allocvec(&invitation).context("serialize signed invitation")?))
+    }
+
+    fn rotate_invitation_key_package(&mut self) -> Result<()> {
+        let provider = provider_from_storage(self.snapshot.mls_storage.clone())?;
+        let signer = read_signer(&provider, &self.snapshot.mls_signature_key)?;
+        let credential = CredentialWithKey {
+            credential: BasicCredential::new(self.snapshot.device_id.as_bytes().to_vec()).into(),
+            signature_key: signer.to_public_vec().into(),
+        };
+        let key_package = KeyPackage::builder()
+            .build(NYX_CIPHERSUITE, &provider, &signer, credential)
+            .map_err(|error| anyhow::anyhow!("build invitation MLS KeyPackage: {error:?}"))?;
+        self.snapshot.mls_key_package = key_package
+            .key_package()
+            .tls_serialize_detached()
+            .map_err(|error| anyhow::anyhow!("serialize invitation MLS KeyPackage: {error:?}"))?;
+        self.snapshot.mls_storage = clone_storage(&provider)?;
+        Ok(())
     }
 
     pub fn issued_invitation(&self, invitation_id: Uuid) -> Option<&IssuedInvitation> {
@@ -583,7 +629,7 @@ impl DeviceIdentity {
             send_mailbox_token: payload.inviter_receive_token,
             receive_mailbox_token: payload.invitee_receive_token,
             verified: false,
-            meshtastic_node_id: None,
+            meshtastic_node_id: payload.meshtastic_node_id,
         })
     }
 
@@ -656,6 +702,14 @@ impl DeviceIdentity {
     /// Accept an imported invitation, create the two-member MLS group and
     /// return a signed Welcome response ready for opaque mailbox transport.
     pub fn accept_invitation(&mut self, device_id: Uuid) -> Result<Vec<u8>> {
+        self.accept_invitation_with_meshtastic_node(device_id, None)
+    }
+
+    pub fn accept_invitation_with_meshtastic_node(
+        &mut self,
+        device_id: Uuid,
+        meshtastic_node_id: Option<u32>,
+    ) -> Result<Vec<u8>> {
         if self.has_session(device_id) {
             bail!("an MLS session with this contact already exists");
         }
@@ -700,6 +754,7 @@ impl DeviceIdentity {
             accepter_identity_public_key: self.snapshot.identity_public_key,
             accepter_mls_key_package: self.snapshot.mls_key_package.clone(),
             mailbox_onion: contact.mailbox_onion,
+            meshtastic_node_id,
             welcome,
         };
         let encoded_payload = postcard::to_allocvec(&payload).context("serialize acceptance")?;
@@ -790,7 +845,7 @@ impl DeviceIdentity {
             send_mailbox_token: issued.invitee_receive_token,
             receive_mailbox_token: issued.inviter_receive_token,
             verified: false,
-            meshtastic_node_id: None,
+            meshtastic_node_id: payload.meshtastic_node_id,
         };
         self.snapshot.mls_storage = clone_storage(&provider)?;
         self.snapshot.sessions.push(RemoteSession {
@@ -1930,7 +1985,10 @@ mod tests {
     fn signed_contact_invitation_verifies_key_package_and_directions() {
         let mut alice = DeviceIdentity::generate("Alice").unwrap();
         let invitation = alice
-            .create_invitation("25njqamcweflpvkl73j4szahhihoc4xt3ktcgjnpaingr5yhkenl5sid.onion")
+            .create_invitation_with_meshtastic_node(
+                "25njqamcweflpvkl73j4szahhihoc4xt3ktcgjnpaingr5yhkenl5sid.onion",
+                Some(0xa1b2c3d4),
+            )
             .unwrap();
         let encoded = URL_SAFE_NO_PAD.decode(&invitation).unwrap();
         let signed: SignedContactInvitation = postcard::from_bytes(&encoded).unwrap();
@@ -1946,6 +2004,7 @@ mod tests {
             signed.payload.invitee_receive_token
         );
         assert!(!contact.verified);
+        assert_eq!(contact.meshtastic_node_id, Some(0xa1b2c3d4));
     }
 
     #[test]
@@ -2014,7 +2073,9 @@ mod tests {
         let mut bob = DeviceIdentity::generate("Bob").unwrap();
         bob.import_invitation(&invitation).unwrap();
 
-        let acceptance = bob.accept_invitation(alice.device_id()).unwrap();
+        let acceptance = bob
+            .accept_invitation_with_meshtastic_node(alice.device_id(), Some(0x9e7638c4))
+            .unwrap();
         let bob_contact = alice.process_invitation_acceptance(&acceptance).unwrap();
         assert!(alice.has_session(bob.device_id()));
         assert!(bob.has_session(alice.device_id()));
@@ -2026,6 +2087,7 @@ mod tests {
             bob.contacts()[0].receive_mailbox_token,
             bob_contact.send_mailbox_token
         );
+        assert_eq!(bob_contact.meshtastic_node_id, Some(0x9e7638c4));
 
         let encrypted = bob
             .encrypt_for_contact(alice.device_id(), b"hello alice")
@@ -2043,5 +2105,53 @@ mod tests {
             bob.decrypt_from_contact(alice.device_id(), &reply).unwrap(),
             b"hello bob"
         );
+    }
+
+    #[test]
+    fn every_invitation_uses_a_distinct_joinable_key_package() {
+        let onion = "25njqamcweflpvkl73j4szahhihoc4xt3ktcgjnpaingr5yhkenl5sid.onion";
+        let mut alice = DeviceIdentity::generate("Alice").unwrap();
+        let first_invitation = alice.create_invitation(onion).unwrap();
+        let second_invitation = alice.create_invitation(onion).unwrap();
+
+        let first_payload = DeviceIdentity::verify_invitation(&first_invitation).unwrap();
+        let second_payload = DeviceIdentity::verify_invitation(&second_invitation).unwrap();
+        assert_ne!(
+            first_payload.mls_key_package,
+            second_payload.mls_key_package
+        );
+
+        let mut bob = DeviceIdentity::generate("Bob").unwrap();
+        let bob_contact = bob.import_invitation(&first_invitation).unwrap();
+        let bob_acceptance = bob.accept_invitation(bob_contact.device_id).unwrap();
+
+        let mut carol = DeviceIdentity::generate("Carol").unwrap();
+        let carol_contact = carol.import_invitation(&second_invitation).unwrap();
+        let carol_acceptance = carol.accept_invitation(carol_contact.device_id).unwrap();
+
+        alice
+            .process_invitation_acceptance(&bob_acceptance)
+            .unwrap();
+        alice
+            .process_invitation_acceptance(&carol_acceptance)
+            .unwrap();
+        assert!(alice.has_session(bob.device_id()));
+        assert!(alice.has_session(carol.device_id()));
+    }
+
+    #[test]
+    fn mailbox_removal_preserves_an_active_endpoint() {
+        let first = "25njqamcweflpvkl73j4szahhihoc4xt3ktcgjnpaingr5yhkenl5sid.onion";
+        let second = "35njqamcweflpvkl73j4szahhihoc4xt3ktcgjnpaingr5yhkenl5sid.onion";
+        let mut identity = DeviceIdentity::generate("Alice").unwrap();
+        identity.add_mailbox(first).unwrap();
+        assert!(identity.remove_mailbox_address(first).is_err());
+        assert_eq!(identity.mailbox_onion(), Some(first));
+
+        identity.add_mailbox(second).unwrap();
+        identity.remove_mailbox_address(first).unwrap();
+        assert_eq!(identity.mailboxes(), &[second.to_owned()]);
+        assert_eq!(identity.mailbox_onion(), Some(second));
+        assert!(identity.remove_mailbox_address(first).is_err());
     }
 }

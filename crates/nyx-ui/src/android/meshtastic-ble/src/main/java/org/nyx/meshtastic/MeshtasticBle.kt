@@ -20,11 +20,14 @@ class MeshtasticBle(private val activity: Activity) {
     companion object {
         private val SERVICE = UUID.fromString("6ba1b218-15a8-461f-9fa8-5dcae273eafd")
         private val TO_RADIO = UUID.fromString("f75c76d2-129e-4dad-a1dd-7866124401e7")
+        private val FROM_RADIO = UUID.fromString("2c55e69e-4993-11ed-b878-0242ac120002")
         private val devices = ConcurrentHashMap<String, String>()
         @Volatile private var state = "DISCONNECTED"
         @Volatile private var gatt: BluetoothGatt? = null
         @Volatile private var scanner: android.bluetooth.le.BluetoothLeScanner? = null
         @Volatile private var activeScanCallback: ScanCallback? = null
+        @Volatile private var fromRadioPacket = ""
+        @Volatile private var readInFlight = false
     }
 
     private val callback = object : BluetoothGattCallback() {
@@ -33,7 +36,12 @@ class MeshtasticBle(private val activity: Activity) {
                 state = "ERROR: Bluetooth GATT $status"
                 g.close()
             } else if (newState == BluetoothProfile.STATE_CONNECTED) {
-                state = "CONNECTED: Dienste werden geprüft …"
+                if (g.device.bondState == BluetoothDevice.BOND_NONE) {
+                    state = "CONNECTED: Meshtastic BLE · Pairing/PIN erforderlich"
+                    g.device.createBond()
+                } else {
+                    state = "CONNECTED: Dienste werden geprüft …"
+                }
                 g.discoverServices()
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 state = "DISCONNECTED"
@@ -42,10 +50,13 @@ class MeshtasticBle(private val activity: Activity) {
         }
 
         override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
-            state = if (status == BluetoothGatt.GATT_SUCCESS && g.getService(SERVICE) != null) {
-                "CONNECTED: Meshtastic BLE"
-            } else {
-                "ERROR: Gerät bietet keinen Meshtastic-Dienst an"
+            val service = g.getService(SERVICE)
+            state = when {
+                status != BluetoothGatt.GATT_SUCCESS || service == null ->
+                    "ERROR: Gerät bietet keinen Meshtastic-Dienst an"
+                service.getCharacteristic(TO_RADIO) == null || service.getCharacteristic(FROM_RADIO) == null ->
+                    "CONNECTED: Meshtastic BLE · Node-ID-Abfrage nicht verfügbar"
+                else -> "CONNECTED: Meshtastic BLE · GATT bereit"
             }
         }
 
@@ -56,12 +67,30 @@ class MeshtasticBle(private val activity: Activity) {
         ) {
             if (characteristic.uuid == TO_RADIO) {
                 state = if (status == BluetoothGatt.GATT_SUCCESS) {
-                    "CONNECTED: Meshtastic BLE · Testpaket geschrieben"
+                    "CONNECTED: Meshtastic BLE · ToRadio geschrieben"
+                } else if (status == BluetoothGatt.GATT_INSUFFICIENT_AUTHENTICATION) {
+                    g.device.createBond()
+                    "CONNECTED: Meshtastic BLE · Pairing/PIN erforderlich"
                 } else {
-                    "ERROR: Meshtastic BLE-Schreibfehler $status"
+                    "CONNECTED: Meshtastic BLE · ToRadio-Schreibfehler $status"
                 }
             }
         }
+
+        @Suppress("DEPRECATION")
+        override fun onCharacteristicRead(
+            g: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            status: Int
+        ) {
+            if (characteristic.uuid == FROM_RADIO) {
+                if (status == BluetoothGatt.GATT_SUCCESS && characteristic.value.isNotEmpty()) {
+                    fromRadioPacket = Base64.encodeToString(characteristic.value, Base64.NO_WRAP)
+                }
+                readInFlight = false
+            }
+        }
+
     }
 
     private val discoveryReceiver = object : BroadcastReceiver() {
@@ -154,6 +183,8 @@ class MeshtasticBle(private val activity: Activity) {
         return try {
             scanner?.stopScan(scanCallback)
             gatt?.close()
+            fromRadioPacket = ""
+            readInFlight = false
             state = "CONNECTING: $address"
             val adapter = activity.getSystemService(BluetoothManager::class.java).adapter
             gatt = adapter.getRemoteDevice(address).connectGatt(activity, false, callback, BluetoothDevice.TRANSPORT_LE)
@@ -165,6 +196,15 @@ class MeshtasticBle(private val activity: Activity) {
     }
 
     fun status(): String = state
+
+    fun bondStatus(): String {
+        val device = gatt?.device ?: return "NONE"
+        return when (device.bondState) {
+            BluetoothDevice.BOND_BONDED -> "BONDED"
+            BluetoothDevice.BOND_BONDING -> "BONDING"
+            else -> "NONE"
+        }
+    }
 
     fun sendToRadio(encoded: String): String {
         if (!ensurePermissions()) return "ERROR: Bluetooth-Berechtigung fehlt"
@@ -196,10 +236,29 @@ class MeshtasticBle(private val activity: Activity) {
         }
     }
 
+    @Synchronized
+    fun readFromRadio(): String {
+        if (fromRadioPacket.isNotEmpty()) {
+            val packet = fromRadioPacket
+            fromRadioPacket = ""
+            return packet
+        }
+        if (readInFlight) return ""
+        val connection = gatt ?: return ""
+        val characteristic = connection.getService(SERVICE)?.getCharacteristic(FROM_RADIO)
+            ?: return ""
+        readInFlight = true
+        @Suppress("DEPRECATION")
+        if (!connection.readCharacteristic(characteristic)) readInFlight = false
+        return ""
+    }
+
     fun disconnect(): String {
         gatt?.disconnect()
         gatt?.close()
         gatt = null
+        fromRadioPacket = ""
+        readInFlight = false
         state = "DISCONNECTED"
         return "Meshtastic-Bluetooth getrennt"
     }

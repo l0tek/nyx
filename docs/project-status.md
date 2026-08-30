@@ -44,8 +44,9 @@ not suitable for sensitive or production communication.
   disconnect, and report connection errors. The main status screen always shows
   Meshtastic state and links directly to its setup.
 - The selected Meshtastic USB port or BLE address is persisted locally and
-  restored on the next client start. Desktop shows a bounded startup progress
-  screen while its local stores are prepared.
+  restored on the next client start. Desktop uses the stable operating-system
+  configuration directory rather than the process working directory. Desktop
+  also shows a bounded startup progress screen while local stores are prepared.
 - A configured desktop radio reports the local Meshtastic node ID, node name,
   hardware model, NodeDB size, battery, voltage, channel utilization, firmware
   environment, selected port, and observed PhoneAPI packet count when supplied
@@ -85,6 +86,8 @@ not suitable for sensitive or production communication.
 - Configuration is available from the Dioxus menu. The bundled default mailbox
   Onion address is shown there and can be edited; additional mailbox entries can
   be added, selected, changed, and persisted locally on desktop and Android.
+- Mailbox removal is address-based rather than dependent on a stale UI list
+  index, and the final active mailbox cannot be removed.
 - Saving configuration provides pressed-state/haptic feedback and a visible
   result. Changing the active Onion address interrupts the polling delay within
   100 ms and immediately checks the newly selected mailbox.

@@ -37,16 +37,26 @@ async fn main() -> Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("nyx-mailbox-data"));
     std::fs::create_dir_all(&data_dir).context("create mailbox data directory")?;
-    let store = Arc::new(MailboxStore::open(
-        data_dir.join("mailbox.sqlite3"),
-        DEFAULT_RETENTION,
-    )?);
+    let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    let clear_mailboxes = arguments
+        .iter()
+        .any(|argument| argument == "--clear-mailboxes")
+        || environment_switch("NYX_MAILBOX_CLEAR_MAILBOXES");
+    let mailbox_path = data_dir.join("mailbox.sqlite3");
+    if clear_mailboxes {
+        clear_mailbox_store(&mailbox_path)?;
+        tracing::warn!(
+            path = %mailbox_path.display(),
+            "all stored mailbox messages were deleted before server startup"
+        );
+    }
+    let store = Arc::new(MailboxStore::open(mailbox_path, DEFAULT_RETENTION)?);
 
     let arti_state_dir = std::env::var_os("NYX_MAILBOX_ARTI_STATE_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| data_dir.join("arti-state"));
-    let reinitialize_onion_identity = std::env::args_os()
-        .skip(1)
+    let reinitialize_onion_identity = arguments
+        .iter()
         .any(|argument| argument == "--reinitialize-onion-identity")
         || environment_switch("NYX_MAILBOX_REINITIALIZE_ONION_IDENTITY");
     if reinitialize_onion_identity {
@@ -149,6 +159,24 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+fn clear_mailbox_store(database: &std::path::Path) -> Result<()> {
+    for path in [
+        database.to_path_buf(),
+        PathBuf::from(format!("{}-wal", database.display())),
+        PathBuf::from(format!("{}-shm", database.display())),
+    ] {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("delete mailbox storage {}", path.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn environment_switch(name: &str) -> bool {
     std::env::var(name).is_ok_and(|value| {
         matches!(
@@ -227,4 +255,29 @@ where
     stream.write_all(&encoded).await?;
     stream.flush().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clear_mailbox_store;
+
+    #[test]
+    fn clear_mailboxes_removes_database_wal_and_shm_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("mailbox.sqlite3");
+        let wal = directory.path().join("mailbox.sqlite3-wal");
+        let shm = directory.path().join("mailbox.sqlite3-shm");
+        let onion_state = directory.path().join("arti-state");
+        std::fs::write(&database, b"db").unwrap();
+        std::fs::write(&wal, b"wal").unwrap();
+        std::fs::write(&shm, b"shm").unwrap();
+        std::fs::create_dir(&onion_state).unwrap();
+
+        clear_mailbox_store(&database).unwrap();
+
+        assert!(!database.exists());
+        assert!(!wal.exists());
+        assert!(!shm.exists());
+        assert!(onion_state.exists());
+    }
 }
