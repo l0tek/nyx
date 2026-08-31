@@ -1,6 +1,6 @@
 # Nyx project status
 
-Status date: 2026-08-28
+Status date: 2026-08-31
 
 Nyx is an architecture/MVP implementation. It is not security-audited and is
 not suitable for sensitive or production communication.
@@ -47,6 +47,10 @@ not suitable for sensitive or production communication.
   restored on the next client start. Desktop uses the stable operating-system
   configuration directory rather than the process working directory. Desktop
   also shows a bounded startup progress screen while local stores are prepared.
+- Desktop automatically reuses an enabled channel named `NYX` or creates it on
+  the first free secondary slot with a random 256-bit PSK. Android recognizes
+  an imported `NYX` channel automatically. The selected local index is persisted
+  and applied to desktop USB fallback fragments and Android BLE test packets.
 - A configured desktop radio reports the local Meshtastic node ID, node name,
   hardware model, NodeDB size, battery, voltage, channel utilization, firmware
   environment, selected port, and observed PhoneAPI packet count when supplied
@@ -96,6 +100,11 @@ not suitable for sensitive or production communication.
   MLS KeyPackage signature/lifetime/ciphersuite, duplicate device IDs, and size
   bounds. Each invitation contains separate random 256-bit capabilities for
   inviter-bound and invitee-bound traffic.
+- Contact invitation version 3 can carry a bounded opaque transport bootstrap
+  inside the Ed25519 signature. NYX exports the active private `NYX` channel
+  configuration this way. Android installs it over the local BLE Admin API only
+  when the connected radio does not already have an active channel named `NYX`;
+  an existing channel and PSK are never overwritten.
 - A verified contact can now accept an invitation in the desktop UI. The
   accepting device creates a real two-member OpenMLS group, adds the inviter's
   persisted KeyPackage, merges the Add commit, and signs a response containing
@@ -248,6 +257,11 @@ not suitable for sensitive or production communication.
 
 ## Security limitations
 
+- A contact QR now contains the shared Meshtastic `NYX` channel PSK inside its
+  signed transport extension. Anyone who obtains that QR can join the radio
+  channel. Share invitations only out of band with the intended contact; MLS
+  still protects message contents independently of the channel encryption.
+
 - Mailbox SQLite pages are not encrypted at rest. Stored message bodies are
   already expected to be MLS ciphertext, but mailbox tokens and timing/size
   metadata remain visible to anyone who obtains the database.
@@ -292,11 +306,10 @@ firmware routing acknowledgements instead of reporting success immediately
 after the local serial write. Android BLE serializes GATT reads and writes so a
 periodic `FromRadio` read cannot cause `ToRadio` to be rejected as busy.
 
-The current end-to-end test to node `!9e7638c4` returns `NO_CHANNEL`. The radio
-transport and acknowledgement path are therefore working, but the receiving
-node cannot decrypt the direct packet. Before resuming code work, verify a
-shared primary-channel PSK, refresh both nodes' NodeDB/public-key entries, and
-confirm a direct message in the official Meshtastic client.
+A private `NYX` channel was installed as channel index 1 on nodes `!9e76506c`
+and `!9e7638c4`. Broadcast and acknowledged direct CLI messages succeeded on
+that channel. NYX now discovers the local channel index automatically so the
+application test can use the same working radio configuration.
 
 Desktop Linux and Android debug packages were also built in this revision. The
 Android package contains both `arm64-v8a` and `x86_64` native libraries. Generated

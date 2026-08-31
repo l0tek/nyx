@@ -2,6 +2,8 @@ use super::MeshtasticStatus;
 use crate::mesh_fragment;
 use dioxus::prelude::*;
 use meshtastic::{Message, api::StreamApi, protobufs::from_radio::PayloadVariant, utils};
+use meshtastic::{packet::PacketRouter, types::NodeId};
+use rand::{RngCore, rngs::OsRng};
 use std::{
     collections::HashSet,
     sync::{Mutex, OnceLock},
@@ -29,6 +31,44 @@ struct PendingAcknowledgement {
 }
 
 static FALLBACK_SESSION: OnceLock<Mutex<Option<FallbackSession>>> = OnceLock::new();
+static NYX_CHANNEL: OnceLock<Mutex<Option<meshtastic::protobufs::Channel>>> = OnceLock::new();
+
+pub(super) fn nyx_channel_bootstrap() -> Option<Vec<u8>> {
+    NYX_CHANNEL
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .ok()?
+        .as_ref()
+        .map(Message::encode_to_vec)
+}
+
+fn remember_nyx_channel(channel: meshtastic::protobufs::Channel) {
+    if let Ok(mut current) = NYX_CHANNEL.get_or_init(|| Mutex::new(None)).lock() {
+        *current = Some(channel);
+    }
+}
+
+struct LocalRouter(u32);
+
+impl PacketRouter<(), std::convert::Infallible> for LocalRouter {
+    fn handle_packet_from_radio(
+        &mut self,
+        _packet: meshtastic::protobufs::FromRadio,
+    ) -> Result<(), std::convert::Infallible> {
+        Ok(())
+    }
+
+    fn handle_mesh_packet(
+        &mut self,
+        _packet: meshtastic::protobufs::MeshPacket,
+    ) -> Result<(), std::convert::Infallible> {
+        Ok(())
+    }
+
+    fn source_node_id(&self) -> NodeId {
+        self.0.into()
+    }
+}
 
 pub(super) async fn dispatch_fallback(
     id: Uuid,
@@ -65,7 +105,9 @@ pub(super) async fn run_session(
     mut status: Signal<MeshtasticStatus>,
     session: Signal<u64>,
     mut own_node_signal: Signal<Option<u32>>,
+    mut channel_index_signal: Signal<u32>,
 ) {
+    let mut channel_index = *channel_index_signal.peek();
     super::append_log("INFO", &format!("Öffne Meshtastic USB-Port {port}"));
     let serial = match utils::stream::build_serial_stream(port.clone(), None, None, None) {
         Ok(serial) => serial,
@@ -115,6 +157,8 @@ pub(super) async fn run_session(
     let mut battery = None::<u32>;
     let mut voltage = None::<f32>;
     let mut utilization = None::<f32>;
+    let mut configured_channels = Vec::<meshtastic::protobufs::Channel>::new();
+    let mut channel_setup_complete = false;
     let (fallback_tx, mut fallback_rx) = mpsc::unbounded_channel();
     if let Ok(mut session) = FALLBACK_SESSION.get_or_init(|| Mutex::new(None)).lock() {
         *session = Some(FallbackSession {
@@ -156,7 +200,7 @@ pub(super) async fn run_session(
                         super::append_log("INFO", &format!("Lokale Meshtastic-Node erkannt: !{:08x}", info.my_node_num));
                         own_node = Some(info.my_node_num);
                         own_node_signal.set(own_node);
-                        let _ = super::save_meshtastic_settings(&port, own_node);
+                        let _ = super::save_meshtastic_settings(&port, own_node, channel_index);
                         node_count = Some(info.nodedb_count);
                         if !info.pio_env.is_empty() { environment = Some(info.pio_env); }
                     }
@@ -173,6 +217,25 @@ pub(super) async fn run_session(
                                 battery = metrics.battery_level;
                                 voltage = metrics.voltage;
                                 utilization = metrics.channel_utilization;
+                            }
+                        }
+                    }
+                    Some(PayloadVariant::Channel(channel)) => {
+                        configured_channels.retain(|current| current.index != channel.index);
+                        configured_channels.push(channel);
+                    }
+                    Some(PayloadVariant::ConfigCompleteId(_)) if !channel_setup_complete => {
+                        channel_setup_complete = true;
+                        match ensure_nyx_channel(&mut api, own_node, &configured_channels).await {
+                            Ok(index) => {
+                                channel_index = index;
+                                channel_index_signal.set(index);
+                                let _ = super::save_meshtastic_settings(&port, own_node, index);
+                                super::append_log("INFO", &format!("Privater Meshtastic-Kanal NYX auf Index {index} aktiv"));
+                            }
+                            Err(error) => {
+                                super::append_log("ERROR", &error);
+                                status.set(MeshtasticStatus { connected: true, detail: error });
                             }
                         }
                     }
@@ -199,7 +262,7 @@ pub(super) async fn run_session(
                         "Meshtastic node identity is not available yet".into(),
                     ));
                 } else {
-                    match send_fallback_fragments(&mut api, own_node.unwrap_or_default(), command.destination, command.id, &command.ciphertext).await {
+                    match send_fallback_fragments(&mut api, own_node.unwrap_or_default(), command.destination, command.id, &command.ciphertext, channel_index).await {
                         Ok(packet_ids) => {
                             fallback_attempted.insert(command.id);
                             pending_acknowledgements.push(PendingAcknowledgement {
@@ -245,12 +308,53 @@ pub(super) async fn run_session(
     }
 }
 
+async fn ensure_nyx_channel(
+    api: &mut meshtastic::api::ConnectedStreamApi,
+    own_node: Option<u32>,
+    channels: &[meshtastic::protobufs::Channel],
+) -> Result<u32, String> {
+    if let Some(channel) = channels.iter().find(|channel| {
+        channel
+            .settings
+            .as_ref()
+            .is_some_and(|settings| settings.name == "NYX")
+            && channel.role != meshtastic::protobufs::channel::Role::Disabled as i32
+    }) {
+        remember_nyx_channel(channel.clone());
+        return u32::try_from(channel.index).map_err(|_| "NYX-Kanalindex ist ungültig".into());
+    }
+    let index = (1..=7)
+        .find(|index| !channels.iter().any(|channel| channel.index == *index))
+        .ok_or_else(|| "Kein freier Meshtastic-Kanal für NYX verfügbar".to_owned())?;
+    let source = own_node.ok_or_else(|| "Lokale Meshtastic-Node-ID fehlt".to_owned())?;
+    let mut psk = vec![0_u8; 32];
+    OsRng.fill_bytes(&mut psk);
+    let channel = meshtastic::protobufs::Channel {
+        index,
+        role: meshtastic::protobufs::channel::Role::Secondary as i32,
+        settings: Some(meshtastic::protobufs::ChannelSettings {
+            psk,
+            name: "NYX".into(),
+            id: utils::generate_rand_id(),
+            ..Default::default()
+        }),
+    };
+    api.update_channel_config(&mut LocalRouter(source), channel.clone())
+        .await
+        .map_err(|error| {
+            format!("Privater Meshtastic-Kanal NYX konnte nicht angelegt werden: {error}")
+        })?;
+    remember_nyx_channel(channel);
+    Ok(index as u32)
+}
+
 async fn send_fallback_fragments(
     api: &mut meshtastic::api::ConnectedStreamApi,
     source: u32,
     destination: u32,
     id: Uuid,
     ciphertext: &[u8],
+    channel_index: u32,
 ) -> Result<Vec<u32>, String> {
     let fragments = mesh_fragment::fragment(id, ciphertext)?;
     let mut packet_ids = Vec::with_capacity(fragments.len());
@@ -260,6 +364,7 @@ async fn send_fallback_fragments(
             from: source,
             to: destination,
             id: packet_id,
+            channel: channel_index,
             want_ack: true,
             payload_variant: Some(meshtastic::protobufs::mesh_packet::PayloadVariant::Decoded(
                 meshtastic::protobufs::Data {

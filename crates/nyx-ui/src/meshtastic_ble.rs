@@ -2,7 +2,87 @@ use super::MeshtasticStatus;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use dioxus::prelude::*;
 use jni::objects::{JClass, JString, JValue};
-use std::time::Duration;
+use meshtastic::Message;
+use std::{
+    sync::{Mutex, OnceLock},
+    time::Duration,
+};
+
+static NYX_CHANNEL: OnceLock<Mutex<Option<meshtastic::protobufs::Channel>>> = OnceLock::new();
+
+pub(super) fn nyx_channel_bootstrap() -> Option<Vec<u8>> {
+    NYX_CHANNEL
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .ok()?
+        .as_ref()
+        .map(Message::encode_to_vec)
+}
+
+pub(super) fn install_nyx_channel_if_missing(
+    encoded: &[u8],
+    own_node: u32,
+) -> Result<Option<u32>, String> {
+    let mut current = NYX_CHANNEL
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .map_err(|_| "Meshtastic-Kanalspeicher ist nicht verfügbar")?;
+    if current.is_some() {
+        return Ok(None);
+    }
+    let channel = meshtastic::protobufs::Channel::decode(encoded)
+        .map_err(|_| "Signierte Einladung enthält keine gültige Meshtastic-Kanalkonfiguration")?;
+    let index = u32::try_from(channel.index)
+        .ok()
+        .filter(|index| (1..=7).contains(index))
+        .ok_or_else(|| "Signierter NYX-Kanal verwendet einen ungültigen Index".to_owned())?;
+    let settings = channel
+        .settings
+        .as_ref()
+        .ok_or_else(|| "Signierter NYX-Kanal enthält keine Einstellungen".to_owned())?;
+    if settings.name != "NYX"
+        || !matches!(settings.psk.len(), 16 | 32)
+        || channel.role != meshtastic::protobufs::channel::Role::Secondary as i32
+    {
+        return Err("Signierte NYX-Kanalkonfiguration ist ungültig".into());
+    }
+    let admin = meshtastic::protobufs::AdminMessage {
+        payload_variant: Some(
+            meshtastic::protobufs::admin_message::PayloadVariant::SetChannel(channel.clone()),
+        ),
+        session_passkey: Vec::new(),
+    };
+    let packet_uuid = uuid::Uuid::new_v4();
+    let packet_id = u32::from_le_bytes(
+        packet_uuid.as_bytes()[..4]
+            .try_into()
+            .map_err(|_| "Meshtastic-Paket-ID konnte nicht erzeugt werden")?,
+    );
+    let packet = meshtastic::protobufs::MeshPacket {
+        from: own_node,
+        to: own_node,
+        id: packet_id,
+        want_ack: true,
+        channel: 0,
+        payload_variant: Some(meshtastic::protobufs::mesh_packet::PayloadVariant::Decoded(
+            meshtastic::protobufs::Data {
+                portnum: meshtastic::protobufs::PortNum::AdminApp as i32,
+                payload: admin.encode_to_vec(),
+                want_response: true,
+                ..Default::default()
+            },
+        )),
+        ..Default::default()
+    };
+    let to_radio = meshtastic::protobufs::ToRadio {
+        payload_variant: Some(meshtastic::protobufs::to_radio::PayloadVariant::Packet(
+            packet,
+        )),
+    };
+    send_to_radio(&to_radio.encode_to_vec())?;
+    *current = Some(channel);
+    Ok(Some(index))
+}
 
 // Keep the FFI declaration so Manganis packages the Kotlin plugin. Calls are
 // made manually below: JNI FindClass cannot see application classes when Rust
@@ -100,9 +180,9 @@ pub(super) async fn monitor(
     mut state: Signal<MeshtasticStatus>,
     session: Signal<u64>,
     mut own_node: Signal<Option<u32>>,
+    mut channel_index: Signal<u32>,
     port: String,
 ) {
-    use meshtastic::Message;
     let mut connected_polls = 0_u8;
     let mut requested_config = false;
     let mut previous_detail = String::new();
@@ -150,24 +230,26 @@ pub(super) async fn monitor(
                                 if let Ok(packet) =
                                     meshtastic::protobufs::FromRadio::decode(bytes.as_slice())
                                 {
-                                    if let Some(
-                                        meshtastic::protobufs::from_radio::PayloadVariant::MyInfo(
-                                            info,
-                                        ),
-                                    ) = packet.payload_variant
-                                    {
-                                        own_node.set(Some(info.my_node_num));
-                                        let _ = super::save_meshtastic_settings(
-                                            &port,
-                                            Some(info.my_node_num),
-                                        );
-                                        super::append_log(
-                                            "INFO",
-                                            &format!(
-                                                "Lokale BLE-Node erkannt: !{:08x}",
-                                                info.my_node_num
-                                            ),
-                                        );
+                                    match packet.payload_variant {
+                                        Some(meshtastic::protobufs::from_radio::PayloadVariant::MyInfo(info)) => {
+                                            own_node.set(Some(info.my_node_num));
+                                            let _ = super::save_meshtastic_settings(&port, Some(info.my_node_num), *channel_index.peek());
+                                            super::append_log("INFO", &format!("Lokale BLE-Node erkannt: !{:08x}", info.my_node_num));
+                                        }
+                                        Some(meshtastic::protobufs::from_radio::PayloadVariant::Channel(channel))
+                                            if channel.settings.as_ref().is_some_and(|settings| settings.name == "NYX")
+                                                && channel.role != meshtastic::protobufs::channel::Role::Disabled as i32 =>
+                                        {
+                                            if let Ok(index) = u32::try_from(channel.index) {
+                                                if let Ok(mut current) = NYX_CHANNEL.get_or_init(|| Mutex::new(None)).lock() {
+                                                    *current = Some(channel.clone());
+                                                }
+                                                channel_index.set(index);
+                                                let _ = super::save_meshtastic_settings(&port, *own_node.peek(), index);
+                                                super::append_log("INFO", &format!("Privater Meshtastic-Kanal NYX auf BLE-Index {index} erkannt"));
+                                            }
+                                        }
+                                        _ => {}
                                     }
                                 }
                             }

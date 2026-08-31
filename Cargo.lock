@@ -4962,6 +4962,7 @@ dependencies = [
  "nyx-store",
  "nyx-tor",
  "qrcode",
+ "rand 0.8.8",
  "tokio",
  "tracing",
  "uuid",

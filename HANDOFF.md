@@ -74,18 +74,19 @@ Keine Transportlogik direkt in UI-Komponenten implementieren.
    Fehler beziehungsweise einen Timeout nach 15 Sekunden.
 2. Android serialisiert GATT-Lese- und Schreiboperationen; dadurch wird der
    Testschreibvorgang nicht mehr von einem parallelen `FromRadio`-Read abgelehnt.
-3. Der aktuelle Funk-Test erreicht die Ziel-Node, wird dort aber mit
-   `NO_CHANNEL` abgelehnt. Laut Meshtastic-Firmware kann die Ziel-Node das Paket
-   dann nicht mit dem gemeinsamen Channel-PSK oder dem gespeicherten
-   Meshtastic-Public-Key entschlüsseln.
-4. Vor dem nächsten NYX-Codeumbau auf beiden Nodes denselben Primary Channel
-   und dieselbe PSK prüfen, veraltete NodeDB/Public-Key-Einträge erneuern und
-   zunächst eine normale Meshtastic-Direktnachricht testen.
+3. Ein zusätzlicher privater Kanal `NYX` ist auf beiden Test-Nodes als Index 1
+   eingerichtet. Broadcast und bestätigte CLI-Direktnachricht funktionieren.
+4. NYX erkennt den Kanal automatisch. Desktop legt ihn bei Bedarf mit einem
+   zufälligen 256-Bit-PSK an; Android erkennt den importierten Kanal. Der lokale
+   Index wird persistent für USB- beziehungsweise BLE-Testpakete verwendet.
+5. Neue signierte Kontakt-QR-Codes enthalten die aktive `NYX`-Kanalkonfiguration.
+   Android installiert sie nur, wenn das verbundene Funkgerät noch keinen
+   aktiven Kanal `NYX` besitzt.
 
 ## Nächster Task
 
-Meshtastic-Konfiguration und Schlüsselaustausch zwischen `!9e76506c` und
-`!9e7638c4` korrigieren und den NYX-Zustellungstest erneut durchführen.
+Die Funkverbindung in NYX neu aufbauen, die automatische Erkennung von Kanal
+`NYX` prüfen und den Zustellungstest zu `!9e7638c4` durchführen.
 
 Ziel:
 
@@ -101,7 +102,7 @@ Nicht sofort große Refactorings durchführen.
 - USB-Verbindung und lokale Node-Erkennung mit realem HELTEC_V3
 - Android Universal-Debug-APK erfolgreich gebaut
 - APK: `dist/nyx-android-meshtastic-bluetooth-universal-debug.apk`
-- SHA-256: `696a22e5cd42c14bdf949136eb45eb96dd22ae33004ffd62dc45f05713865b73`
+- SHA-256: `6de36e882ba7a9409ba051b883117e79105c7f0b05c69d389d600cb23391f512`
 - 43 Workspace-Tests erfolgreich
 
 ## Build

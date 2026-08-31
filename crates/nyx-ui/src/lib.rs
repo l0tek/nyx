@@ -189,6 +189,7 @@ struct MeshtasticStatus {
 struct MeshtasticSettings {
     port: String,
     own_node_id: Option<u32>,
+    channel_index: u32,
 }
 
 impl MeshtasticStatus {
@@ -272,6 +273,7 @@ pub fn App() -> Element {
     let mut meshtastic_ports = use_signal(Vec::<String>::new);
     let mut meshtastic_port = use_signal(|| initial_meshtastic.port);
     let meshtastic_own_node = use_signal(|| initial_meshtastic.own_node_id);
+    let meshtastic_channel_index = use_signal(|| initial_meshtastic.channel_index);
     let meshtastic_status = use_signal(MeshtasticStatus::idle);
     let meshtastic_session = use_signal(|| 0_u64);
     let mut meshtastic_autoconnect = use_signal(|| automatic_meshtastic_enabled);
@@ -352,6 +354,7 @@ pub fn App() -> Element {
             meshtastic_status,
             meshtastic_session,
             meshtastic_own_node,
+            meshtastic_channel_index,
             meshtastic_autoconnect,
         )
     });
@@ -606,6 +609,10 @@ pub fn App() -> Element {
                                 "Lokale Node-ID: ",
                                 {(*meshtastic_own_node.read()).map(|node| format!("!{node:08x}")).unwrap_or_else(|| "noch unbekannt".into())}
                             }
+                            p { class: "transport-endpoint",
+                                "Privater NYX-Kanal: ",
+                                strong { "NYX · Index {meshtastic_channel_index}" }
+                            }
                             if let Some(contact) = active_contact.as_ref() {
                                 p { class: "transport-endpoint",
                                     "Testkontakt: {contact.display_name} · ",
@@ -621,7 +628,7 @@ pub fn App() -> Element {
                                             spawn(async move {
                                                 let destination = contact_meshtastic_destination(&identity, device_id);
                                                 let message = match destination {
-                                                    Ok((name, node)) => match send_meshtastic_test(node).await {
+                                                    Ok((name, node)) => match send_meshtastic_test(node, *meshtastic_channel_index.peek()).await {
                                                         Ok(()) => format!("Meshtastic-Test an {name} (!{node:08x}) zugestellt und bestätigt"),
                                                         Err(error) => format!("Meshtastic-Test fehlgeschlagen: {error}"),
                                                     },
@@ -718,6 +725,7 @@ pub fn App() -> Element {
                                     onchange: move |event| persist_meshtastic_selection(event.value(), &mut meshtastic_port, meshtastic_status),
                                 }
                             }
+                            p { class: "transport-endpoint", "NYX-Kanal: wird automatisch erkannt oder sicher angelegt · aktueller Index {meshtastic_channel_index}" }
                             if !meshtastic_ports.read().is_empty() {
                                 div { class: "field",
                                     label { if cfg!(target_os = "android") { "Gefundenes Bluetooth-Gerät auswählen" } else { "Gefundenen seriellen Port auswählen" } }
@@ -744,7 +752,7 @@ pub fn App() -> Element {
                                     disabled: meshtastic_port.read().trim().is_empty() || meshtastic_status.read().connected,
                                     onclick: move |_| {
                                         meshtastic_autoconnect.set(true);
-                                        connect_meshtastic_usb(meshtastic_port.read().trim().to_owned(), meshtastic_status, meshtastic_session, meshtastic_own_node);
+                                        connect_meshtastic_usb(meshtastic_port.read().trim().to_owned(), meshtastic_status, meshtastic_session, meshtastic_own_node, meshtastic_channel_index);
                                     },
                                     "Verbinden"
                                 }
@@ -792,7 +800,7 @@ pub fn App() -> Element {
                             class: "primary",
                             disabled: invitation_input.read().trim().is_empty(),
                             onclick: move |_| {
-                                if import_contact_invitation(&mut identity, autosave_password, &mut invitation_input, &mut contact_status, recipient_mailbox_token, local_mailbox_token, &mut selected_contact) {
+                                if import_contact_invitation(&mut identity, autosave_password, &mut invitation_input, &mut contact_status, recipient_mailbox_token, local_mailbox_token, &mut selected_contact, meshtastic_own_node, meshtastic_channel_index) {
                                     navigate_to(&mut app_view, AppView::Chat, &mut back_history, &mut forward_history);
                                 }
                             },
@@ -1007,8 +1015,9 @@ fn connect_meshtastic_usb(
     mut status: Signal<MeshtasticStatus>,
     mut session: Signal<u64>,
     own_node: Signal<Option<u32>>,
+    channel_index: Signal<u32>,
 ) {
-    if let Err(error) = save_meshtastic_settings(&port, *own_node.peek()) {
+    if let Err(error) = save_meshtastic_settings(&port, *own_node.peek(), *channel_index.peek()) {
         status.set(MeshtasticStatus {
             connected: false,
             detail: error,
@@ -1021,7 +1030,9 @@ fn connect_meshtastic_usb(
         connected: false,
         detail: format!("Verbinde mit {port} …"),
     });
-    spawn(async move { meshtastic_usb::run_session(port, id, status, session, own_node).await });
+    spawn(async move {
+        meshtastic_usb::run_session(port, id, status, session, own_node, channel_index).await
+    });
 }
 
 fn persist_meshtastic_selection(
@@ -1033,7 +1044,8 @@ fn persist_meshtastic_selection(
     if port.trim().is_empty() {
         return;
     }
-    match save_meshtastic_settings(&port, None) {
+    let current = load_meshtastic_settings();
+    match save_meshtastic_settings(&port, current.own_node_id, current.channel_index) {
         Ok(()) => {
             let connected = status.read().connected;
             status.set(MeshtasticStatus {
@@ -1054,8 +1066,9 @@ fn connect_meshtastic_usb(
     mut status: Signal<MeshtasticStatus>,
     mut session: Signal<u64>,
     own_node: Signal<Option<u32>>,
+    channel_index: Signal<u32>,
 ) {
-    if let Err(error) = save_meshtastic_settings(&port, *own_node.peek()) {
+    if let Err(error) = save_meshtastic_settings(&port, *own_node.peek(), *channel_index.peek()) {
         status.set(MeshtasticStatus {
             connected: false,
             detail: error,
@@ -1070,9 +1083,9 @@ fn connect_meshtastic_usb(
                 connected: false,
                 detail,
             });
-            spawn(
-                async move { meshtastic_ble::monitor(id, status, session, own_node, port).await },
-            );
+            spawn(async move {
+                meshtastic_ble::monitor(id, status, session, own_node, channel_index, port).await
+            });
         }
         Err(error) => status.set(MeshtasticStatus {
             connected: false,
@@ -1108,6 +1121,7 @@ async fn run_meshtastic_autoconnect(
     status: Signal<MeshtasticStatus>,
     session: Signal<u64>,
     own_node: Signal<Option<u32>>,
+    channel_index: Signal<u32>,
     autoconnect: Signal<bool>,
 ) {
     append_log("INFO", "Meshtastic-Auto-Connect gestartet");
@@ -1143,7 +1157,7 @@ async fn run_meshtastic_autoconnect(
             "INFO",
             &format!("Automatischer Meshtastic-Verbindungsversuch: {port}"),
         );
-        connect_meshtastic_usb(port, status, session, own_node);
+        connect_meshtastic_usb(port, status, session, own_node, channel_index);
         // Android pairing and GATT service discovery can legitimately take
         // longer than a few seconds. Reconnecting too early closes our own
         // in-flight GATT session and creates an endless connection loop.
@@ -1248,18 +1262,31 @@ fn load_meshtastic_settings() -> MeshtasticSettings {
     let own_node_id = lines
         .next()
         .and_then(|value| u32::from_str_radix(value.trim().trim_start_matches('!'), 16).ok());
+    let channel_index = lines
+        .next()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|value| *value <= 7)
+        .unwrap_or_default();
     if port.is_empty() || port.len() > 512 || port.contains(['\r', '\n']) {
         MeshtasticSettings::default()
     } else {
         #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
         if legacy {
-            let _ = save_meshtastic_settings(&port, own_node_id);
+            let _ = save_meshtastic_settings(&port, own_node_id, channel_index);
         }
-        MeshtasticSettings { port, own_node_id }
+        MeshtasticSettings {
+            port,
+            own_node_id,
+            channel_index,
+        }
     }
 }
 
-fn save_meshtastic_settings(port: &str, own_node_id: Option<u32>) -> Result<(), String> {
+fn save_meshtastic_settings(
+    port: &str,
+    own_node_id: Option<u32>,
+    channel_index: u32,
+) -> Result<(), String> {
     let port = port.trim();
     if port.is_empty() || port.len() > 512 || port.contains(['\r', '\n']) {
         return Err("Meshtastic-Geräteadresse ist ungültig".into());
@@ -1271,8 +1298,11 @@ fn save_meshtastic_settings(port: &str, own_node_id: Option<u32>) -> Result<(), 
         })?;
     }
     let temporary = path.with_extension("tmp");
-    let encoded =
-        own_node_id.map_or_else(|| port.to_owned(), |node| format!("{port}\n!{node:08x}\n"));
+    if channel_index > 7 {
+        return Err("Meshtastic-Kanalindex muss zwischen 0 und 7 liegen".into());
+    }
+    let node = own_node_id.map_or_else(String::new, |node| format!("!{node:08x}"));
+    let encoded = format!("{port}\n{node}\n{channel_index}\n");
     std::fs::write(&temporary, encoded.as_bytes()).map_err(|error| {
         format!("Meshtastic-Einstellungen können nicht gespeichert werden: {error}")
     })?;
@@ -1836,7 +1866,7 @@ async fn attempt_meshtastic_fallback(
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-async fn send_meshtastic_test(destination: u32) -> Result<(), String> {
+async fn send_meshtastic_test(destination: u32, _channel_index: u32) -> Result<(), String> {
     let id = uuid::Uuid::new_v4();
     meshtastic_usb::dispatch_fallback(id, destination, b"NYX Meshtastic send test".to_vec())
         .await?
@@ -1845,7 +1875,7 @@ async fn send_meshtastic_test(destination: u32) -> Result<(), String> {
 }
 
 #[cfg(target_os = "android")]
-async fn send_meshtastic_test(destination: u32) -> Result<(), String> {
+async fn send_meshtastic_test(destination: u32, channel_index: u32) -> Result<(), String> {
     use meshtastic::Message;
     use meshtastic::protobufs::{Data, MeshPacket, PortNum, ToRadio};
 
@@ -1857,6 +1887,7 @@ async fn send_meshtastic_test(destination: u32) -> Result<(), String> {
     let packet_id = u32::from_le_bytes(id.as_bytes()[..4].try_into().unwrap());
     let packet = MeshPacket {
         to: destination,
+        channel: channel_index,
         id: packet_id,
         want_ack: true,
         payload_variant: Some(meshtastic::protobufs::mesh_packet::PayloadVariant::Decoded(
@@ -2188,8 +2219,16 @@ fn create_contact_invitation(
             .mailbox_onion()
             .ok_or_else(|| "Configure the Onion mailbox address first".to_owned())?
             .to_owned();
+        let channel_bootstrap = nyx_channel_bootstrap().ok_or_else(|| {
+            "Verbinde zuerst das Meshtastic-Gerät und warte auf die Erkennung des Kanals NYX"
+                .to_owned()
+        })?;
         let invitation = device
-            .create_invitation_with_meshtastic_node(onion, meshtastic_own_node())
+            .create_invitation_with_transport_extension(
+                onion,
+                meshtastic_own_node(),
+                channel_bootstrap,
+            )
             .map_err(|error| error.to_string())?;
         let directions =
             DeviceIdentity::verify_invitation(&invitation).map_err(|error| error.to_string())?;
@@ -2275,34 +2314,42 @@ fn import_contact_invitation(
     mut recipient_token: Signal<Option<[u8; 32]>>,
     mut local_token: Signal<Vec<[u8; 32]>>,
     selected_contact: &mut Signal<Option<uuid::Uuid>>,
+    meshtastic_own_node: Signal<Option<u32>>,
+    mut meshtastic_channel_index: Signal<u32>,
 ) -> bool {
-    let result = (|| -> Result<ContactRecord, String> {
+    let result = (|| -> Result<(ContactRecord, Vec<u8>), String> {
         let mut identity_state = identity.write();
         let device = identity_state
             .as_mut()
             .map_err(|error| error.clone())?
             .as_mut()
             .ok_or_else(|| "Device is locked".to_owned())?;
-        let contact = device
-            .import_invitation(input.read().trim())
+        let (contact, transport_extension) = device
+            .import_invitation_with_transport_extension(input.read().trim())
             .map_err(|error| error.to_string())?;
         device
             .save_encrypted(identity_path(), autosave_password.read().as_slice())
             .map_err(|error| error.to_string())?;
-        Ok(contact)
+        Ok((contact, transport_extension))
     })();
     match result {
-        Ok(contact) => {
+        Ok((contact, transport_extension)) => {
             recipient_token.set(Some(contact.send_mailbox_token));
             let mut receive_tokens = local_token.read().clone();
             add_receive_token(&mut receive_tokens, contact.receive_mailbox_token);
             local_token.set(receive_tokens);
             selected_contact.set(Some(contact.device_id));
             input.set(String::new());
-            status.set(Some(format!(
-                "Kontakt {} wurde geprüft und importiert",
-                contact.display_name
-            )));
+            let channel_status =
+                install_imported_nyx_channel(&transport_extension, *meshtastic_own_node.peek());
+            match channel_status {
+                Ok(Some(index)) => {
+                    meshtastic_channel_index.set(index);
+                    status.set(Some(format!("Kontakt {} wurde geprüft und importiert; privater Kanal NYX wurde auf Index {index} installiert", contact.display_name)));
+                }
+                Ok(None) => status.set(Some(format!("Kontakt {} wurde geprüft und importiert; vorhandener Kanal NYX bleibt unverändert", contact.display_name))),
+                Err(error) => status.set(Some(format!("Kontakt {} wurde importiert; NYX-Kanal konnte nicht installiert werden: {error}", contact.display_name))),
+            }
             true
         }
         Err(error) => {
@@ -2310,6 +2357,36 @@ fn import_contact_invitation(
             false
         }
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+fn nyx_channel_bootstrap() -> Option<Vec<u8>> {
+    meshtastic_usb::nyx_channel_bootstrap()
+}
+
+#[cfg(target_os = "android")]
+fn nyx_channel_bootstrap() -> Option<Vec<u8>> {
+    meshtastic_ble::nyx_channel_bootstrap()
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+fn install_imported_nyx_channel(
+    _encoded: &[u8],
+    _own_node: Option<u32>,
+) -> Result<Option<u32>, String> {
+    Ok(None)
+}
+
+#[cfg(target_os = "android")]
+fn install_imported_nyx_channel(
+    encoded: &[u8],
+    own_node: Option<u32>,
+) -> Result<Option<u32>, String> {
+    let own_node = own_node.ok_or_else(|| {
+        "Meshtastic-Gerät ist nicht vollständig verbunden; erneut verbinden und Import wiederholen"
+            .to_owned()
+    })?;
+    meshtastic_ble::install_nyx_channel_if_missing(encoded, own_node)
 }
 
 fn select_contact(

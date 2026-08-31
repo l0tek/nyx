@@ -31,7 +31,8 @@ const SNAPSHOT_VERSION: u16 = 3;
 const MAX_INBOUND_RECEIPTS: usize = 4096;
 const MAX_OUTBOUND_JOURNAL: usize = 1024;
 const DEVICE_SNAPSHOT_VERSION: u16 = 1;
-const INVITATION_VERSION: u16 = 2;
+const INVITATION_VERSION: u16 = 3;
+const MAX_TRANSPORT_EXTENSION_SIZE: usize = 4096;
 const MAX_DISPLAY_NAME_SIZE: usize = 64;
 const MAX_CONTACTS: usize = 1024;
 const INVITATION_LIFETIME_MS: i64 = 7 * 24 * 60 * 60 * 1000;
@@ -148,6 +149,8 @@ pub struct ContactInvitationPayload {
     pub mls_key_package: Vec<u8>,
     pub mailbox_onion: String,
     pub meshtastic_node_id: Option<u32>,
+    /// Opaque, signed transport bootstrap data interpreted outside this crate.
+    pub transport_extension: Vec<u8>,
     /// Recipient uses this token to send messages to the inviter.
     pub inviter_receive_token: [u8; 32],
     /// Recipient polls this token for messages sent by the inviter.
@@ -503,6 +506,22 @@ impl DeviceIdentity {
         mailbox_onion: impl Into<String>,
         meshtastic_node_id: Option<u32>,
     ) -> Result<String> {
+        self.create_invitation_with_transport_extension(
+            mailbox_onion,
+            meshtastic_node_id,
+            Vec::new(),
+        )
+    }
+
+    pub fn create_invitation_with_transport_extension(
+        &mut self,
+        mailbox_onion: impl Into<String>,
+        meshtastic_node_id: Option<u32>,
+        transport_extension: Vec<u8>,
+    ) -> Result<String> {
+        if transport_extension.len() > MAX_TRANSPORT_EXTENSION_SIZE {
+            bail!("contact invitation transport extension is too large");
+        }
         let mailbox_onion = validate_onion_address(mailbox_onion.into())?;
         // An MLS KeyPackage is single-use: processing a Welcome consumes its
         // private init key. Reusing the device's original package for several
@@ -522,6 +541,7 @@ impl DeviceIdentity {
             mls_key_package: self.snapshot.mls_key_package.clone(),
             mailbox_onion,
             meshtastic_node_id,
+            transport_extension,
             inviter_receive_token,
             invitee_receive_token,
             created_unix_ms: now,
@@ -573,6 +593,12 @@ impl DeviceIdentity {
     }
 
     pub fn verify_invitation(encoded: &str) -> Result<ContactRecord> {
+        Self::verify_invitation_with_transport_extension(encoded).map(|(contact, _)| contact)
+    }
+
+    pub fn verify_invitation_with_transport_extension(
+        encoded: &str,
+    ) -> Result<(ContactRecord, Vec<u8>)> {
         if encoded.len() > 256 * 1024 {
             bail!("contact invitation exceeds maximum size");
         }
@@ -584,6 +610,9 @@ impl DeviceIdentity {
         let payload = &invitation.payload;
         if payload.version != INVITATION_VERSION {
             bail!("contact invitation version is unsupported");
+        }
+        if payload.transport_extension.len() > MAX_TRANSPORT_EXTENSION_SIZE {
+            bail!("contact invitation transport extension is too large");
         }
         validate_display_name(payload.inviter_display_name.clone())?;
         validate_onion_address(payload.mailbox_onion.clone())?;
@@ -618,7 +647,7 @@ impl DeviceIdentity {
         if key_package.ciphersuite() != NYX_CIPHERSUITE {
             bail!("contact invitation uses an unsupported MLS ciphersuite");
         }
-        Ok(ContactRecord {
+        let contact = ContactRecord {
             invitation_id: payload.invitation_id,
             device_id: payload.inviter_device_id,
             display_name: payload.inviter_display_name.clone(),
@@ -630,14 +659,24 @@ impl DeviceIdentity {
             receive_mailbox_token: payload.invitee_receive_token,
             verified: false,
             meshtastic_node_id: payload.meshtastic_node_id,
-        })
+        };
+        Ok((contact, payload.transport_extension.clone()))
     }
 
     pub fn import_invitation(&mut self, encoded: &str) -> Result<ContactRecord> {
+        self.import_invitation_with_transport_extension(encoded)
+            .map(|(contact, _)| contact)
+    }
+
+    pub fn import_invitation_with_transport_extension(
+        &mut self,
+        encoded: &str,
+    ) -> Result<(ContactRecord, Vec<u8>)> {
         if self.snapshot.contacts.len() >= MAX_CONTACTS {
             bail!("contact limit reached");
         }
-        let contact = Self::verify_invitation(encoded)?;
+        let (contact, transport_extension) =
+            Self::verify_invitation_with_transport_extension(encoded)?;
         if contact.identity_public_key == self.snapshot.identity_public_key {
             bail!("cannot import an invitation from this device");
         }
@@ -650,7 +689,7 @@ impl DeviceIdentity {
             bail!("contact device is already imported");
         }
         self.snapshot.contacts.push(contact.clone());
-        Ok(contact)
+        Ok((contact, transport_extension))
     }
 
     pub fn mark_contact_verified(&mut self, device_id: Uuid) -> Result<()> {
@@ -1985,9 +2024,10 @@ mod tests {
     fn signed_contact_invitation_verifies_key_package_and_directions() {
         let mut alice = DeviceIdentity::generate("Alice").unwrap();
         let invitation = alice
-            .create_invitation_with_meshtastic_node(
+            .create_invitation_with_transport_extension(
                 "25njqamcweflpvkl73j4szahhihoc4xt3ktcgjnpaingr5yhkenl5sid.onion",
                 Some(0xa1b2c3d4),
+                b"signed opaque transport bootstrap".to_vec(),
             )
             .unwrap();
         let encoded = URL_SAFE_NO_PAD.decode(&invitation).unwrap();
@@ -2005,6 +2045,9 @@ mod tests {
         );
         assert!(!contact.verified);
         assert_eq!(contact.meshtastic_node_id, Some(0xa1b2c3d4));
+        let (_, transport) =
+            DeviceIdentity::verify_invitation_with_transport_extension(&invitation).unwrap();
+        assert_eq!(transport, b"signed opaque transport bootstrap");
     }
 
     #[test]
