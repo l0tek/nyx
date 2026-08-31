@@ -283,8 +283,20 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo check --workspace
 ```
 
-All commands pass, including 37 workspace tests. A successful compile and unit-test run does not verify
+All commands pass, including 43 workspace tests. A successful compile and unit-test run does not verify
 publication or reachability on the public Tor network.
+
+The desktop client was also connected to a real HELTEC_V3 over `/dev/ttyUSB0`
+and detected local node `!9e76506c`. Meshtastic test packets now wait for
+firmware routing acknowledgements instead of reporting success immediately
+after the local serial write. Android BLE serializes GATT reads and writes so a
+periodic `FromRadio` read cannot cause `ToRadio` to be rejected as busy.
+
+The current end-to-end test to node `!9e7638c4` returns `NO_CHANNEL`. The radio
+transport and acknowledgement path are therefore working, but the receiving
+node cannot decrypt the direct packet. Before resuming code work, verify a
+shared primary-channel PSK, refresh both nodes' NodeDB/public-key entries, and
+confirm a direct message in the official Meshtastic client.
 
 Desktop Linux and Android debug packages were also built in this revision. The
 Android package contains both `arm64-v8a` and `x86_64` native libraries. Generated

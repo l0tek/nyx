@@ -1,11 +1,11 @@
 use super::MeshtasticStatus;
 use crate::mesh_fragment;
 use dioxus::prelude::*;
-use meshtastic::{api::StreamApi, protobufs::from_radio::PayloadVariant, utils};
+use meshtastic::{Message, api::StreamApi, protobufs::from_radio::PayloadVariant, utils};
 use std::{
     collections::HashSet,
     sync::{Mutex, OnceLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
@@ -17,19 +17,30 @@ struct FallbackCommand {
     result: oneshot::Sender<Result<bool, String>>,
 }
 
-static FALLBACK_SENDER: OnceLock<Mutex<Option<mpsc::UnboundedSender<FallbackCommand>>>> =
-    OnceLock::new();
+struct FallbackSession {
+    id: u64,
+    sender: mpsc::UnboundedSender<FallbackCommand>,
+}
+
+struct PendingAcknowledgement {
+    packet_ids: HashSet<u32>,
+    deadline: Instant,
+    result: oneshot::Sender<Result<bool, String>>,
+}
+
+static FALLBACK_SESSION: OnceLock<Mutex<Option<FallbackSession>>> = OnceLock::new();
 
 pub(super) async fn dispatch_fallback(
     id: Uuid,
     destination: u32,
     ciphertext: Vec<u8>,
 ) -> Result<bool, String> {
-    let sender = FALLBACK_SENDER
+    let sender = FALLBACK_SESSION
         .get_or_init(|| Mutex::new(None))
         .lock()
         .map_err(|_| "Meshtastic fallback lock is poisoned")?
-        .clone()
+        .as_ref()
+        .map(|session| session.sender.clone())
         .ok_or_else(|| "no configured Meshtastic USB session".to_owned())?;
     let (result_tx, result_rx) = oneshot::channel();
     sender
@@ -94,7 +105,10 @@ pub(super) async fn run_session(
     super::append_log("INFO", &format!("Meshtastic über {port} verbunden"));
     let mut packet_count = 0_u64;
     let mut node_count = None::<u32>;
-    let mut own_node = None::<u32>;
+    // The node ID is persisted together with the selected port. Reuse it
+    // immediately after reconnecting instead of blocking outbound packets
+    // until the radio happens to emit another MyInfo packet.
+    let mut own_node = *own_node_signal.peek();
     let mut environment = None::<String>;
     let mut radio_name = None::<String>;
     let mut hardware = None::<String>;
@@ -102,10 +116,14 @@ pub(super) async fn run_session(
     let mut voltage = None::<f32>;
     let mut utilization = None::<f32>;
     let (fallback_tx, mut fallback_rx) = mpsc::unbounded_channel();
-    if let Ok(mut sender) = FALLBACK_SENDER.get_or_init(|| Mutex::new(None)).lock() {
-        *sender = Some(fallback_tx);
+    if let Ok(mut session) = FALLBACK_SESSION.get_or_init(|| Mutex::new(None)).lock() {
+        *session = Some(FallbackSession {
+            id,
+            sender: fallback_tx,
+        });
     }
     let mut fallback_attempted = HashSet::<Uuid>::new();
+    let mut pending_acknowledgements = Vec::<PendingAcknowledgement>::new();
     loop {
         tokio::select! {
             packet = packets.recv() => {
@@ -115,6 +133,24 @@ pub(super) async fn run_session(
                     break;
                 };
                 packet_count += 1;
+                if let Some(PayloadVariant::Packet(mesh_packet)) = &packet.payload_variant
+                    && let Some((request_id, acknowledgement)) = routing_acknowledgement(mesh_packet)
+                    && let Some(index) = pending_acknowledgements
+                        .iter()
+                        .position(|pending| pending.packet_ids.contains(&request_id))
+                {
+                    if let Err(error) = acknowledgement {
+                        let pending = pending_acknowledgements.swap_remove(index);
+                        let _ = pending.result.send(Err(error));
+                    } else {
+                        let pending = &mut pending_acknowledgements[index];
+                        pending.packet_ids.remove(&request_id);
+                        if pending.packet_ids.is_empty() {
+                            let pending = pending_acknowledgements.swap_remove(index);
+                            let _ = pending.result.send(Ok(true));
+                        }
+                    }
+                }
                 match packet.payload_variant {
                     Some(PayloadVariant::MyInfo(info)) => {
                         super::append_log("INFO", &format!("Lokale Meshtastic-Node erkannt: !{:08x}", info.my_node_num));
@@ -156,21 +192,41 @@ pub(super) async fn run_session(
                 });
             }
             Some(command) = fallback_rx.recv() => {
-                let result = if fallback_attempted.contains(&command.id) {
-                    Ok(false)
+                if fallback_attempted.contains(&command.id) {
+                    let _ = command.result.send(Ok(false));
                 } else if own_node.is_none() {
-                    Err("Meshtastic node identity is not available yet".into())
+                    let _ = command.result.send(Err(
+                        "Meshtastic node identity is not available yet".into(),
+                    ));
                 } else {
-                    send_fallback_fragments(&mut api, own_node.unwrap_or_default(), command.destination, command.id, &command.ciphertext)
-                        .await
-                        .map(|()| {
+                    match send_fallback_fragments(&mut api, own_node.unwrap_or_default(), command.destination, command.id, &command.ciphertext).await {
+                        Ok(packet_ids) => {
                             fallback_attempted.insert(command.id);
-                            true
-                        })
-                };
-                let _ = command.result.send(result);
+                            pending_acknowledgements.push(PendingAcknowledgement {
+                                packet_ids: packet_ids.into_iter().collect(),
+                                deadline: Instant::now() + Duration::from_secs(15),
+                                result: command.result,
+                            });
+                        }
+                        Err(error) => {
+                            let _ = command.result.send(Err(error));
+                        }
+                    }
+                }
             }
             _ = tokio::time::sleep(Duration::from_millis(200)) => {
+                let now = Instant::now();
+                let mut index = 0;
+                while index < pending_acknowledgements.len() {
+                    if pending_acknowledgements[index].deadline <= now {
+                        let pending = pending_acknowledgements.swap_remove(index);
+                        let _ = pending.result.send(Err(
+                            "keine Meshtastic-Zustellbestätigung innerhalb von 15 Sekunden".into(),
+                        ));
+                    } else {
+                        index += 1;
+                    }
+                }
                 if *session.peek() != id {
                     let detail = match api.disconnect().await {
                         Ok(_) => "Meshtastic-Verbindung getrennt".to_owned(),
@@ -182,8 +238,10 @@ pub(super) async fn run_session(
             }
         }
     }
-    if let Ok(mut sender) = FALLBACK_SENDER.get_or_init(|| Mutex::new(None)).lock() {
-        *sender = None;
+    if let Ok(mut session) = FALLBACK_SESSION.get_or_init(|| Mutex::new(None)).lock()
+        && session.as_ref().is_some_and(|current| current.id == id)
+    {
+        *session = None;
     }
 }
 
@@ -193,13 +251,15 @@ async fn send_fallback_fragments(
     destination: u32,
     id: Uuid,
     ciphertext: &[u8],
-) -> Result<(), String> {
+) -> Result<Vec<u32>, String> {
     let fragments = mesh_fragment::fragment(id, ciphertext)?;
+    let mut packet_ids = Vec::with_capacity(fragments.len());
     for fragment in fragments {
+        let packet_id = utils::generate_rand_id();
         let packet = meshtastic::protobufs::MeshPacket {
             from: source,
             to: destination,
-            id: utils::generate_rand_id(),
+            id: packet_id,
             want_ack: true,
             payload_variant: Some(meshtastic::protobufs::mesh_packet::PayloadVariant::Decoded(
                 meshtastic::protobufs::Data {
@@ -215,6 +275,34 @@ async fn send_fallback_fragments(
         ))
         .await
         .map_err(|error| format!("Meshtastic fragment dispatch failed: {error}"))?;
+        packet_ids.push(packet_id);
     }
-    Ok(())
+    Ok(packet_ids)
+}
+
+fn routing_acknowledgement(
+    packet: &meshtastic::protobufs::MeshPacket,
+) -> Option<(u32, Result<(), String>)> {
+    let meshtastic::protobufs::mesh_packet::PayloadVariant::Decoded(data) =
+        packet.payload_variant.as_ref()?
+    else {
+        return None;
+    };
+    if data.portnum != meshtastic::protobufs::PortNum::RoutingApp as i32 || data.request_id == 0 {
+        return None;
+    }
+    let routing = meshtastic::protobufs::Routing::decode(data.payload.as_slice()).ok()?;
+    let result = match routing.variant {
+        Some(meshtastic::protobufs::routing::Variant::ErrorReason(reason)) if reason != 0 => {
+            let detail = match meshtastic::protobufs::routing::Error::try_from(reason) {
+                Ok(meshtastic::protobufs::routing::Error::NoChannel) =>
+                    "NO_CHANNEL – Ziel konnte das Paket nicht entschlüsseln; Channel-PSK und Meshtastic-Public-Keys beider Nodes aktualisieren".to_owned(),
+                Ok(error) => error.as_str_name().to_owned(),
+                Err(_) => format!("unbekannter Routing-Fehler {reason}"),
+            };
+            Err(format!("Meshtastic-Zustellung abgelehnt: {detail}"))
+        }
+        _ => Ok(()),
+    };
+    Some((data.request_id, result))
 }

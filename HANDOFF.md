@@ -27,11 +27,13 @@ Aktuelles Entwicklungsgerät:
 - Meshtastic-Gerät über `/dev/ttyUSB0`
 
 Meshtastic:
-- Gerät wird über CLI erkannt
+- Desktop-Gerät ist unter `/dev/ttyUSB0` erreichbar
 - Hardware: HELTEC_V3
 - Region: EU_868
 - LoRa funktioniert
-- Bluetooth wird aktuell untersucht
+- NYX erkennt die lokale Desktop-Node `!9e76506c`
+- Android BLE verbindet sich und kann GATT-Lese-/Schreiboperationen ausführen
+- Testkontakt auf Android/Handy: `!9e7638c4`
 
 ## Architektur
 
@@ -68,27 +70,44 @@ Keine Transportlogik direkt in UI-Komponenten implementieren.
 
 ## Aktuelle Probleme
 
-1. Meshtastic-Integration weiter stabilisieren.
-2. Bluetooth-Kopplung des Heltec-V3 testen.
-3. Desktop-App mit realem Meshtastic-Gerät verbinden.
-4. Fehlerbehandlung bei Verbindungsabbruch verbessern.
+1. Der Desktop-Test wartet jetzt auf echte Meshtastic-Routing-ACKs und meldet
+   Fehler beziehungsweise einen Timeout nach 15 Sekunden.
+2. Android serialisiert GATT-Lese- und Schreiboperationen; dadurch wird der
+   Testschreibvorgang nicht mehr von einem parallelen `FromRadio`-Read abgelehnt.
+3. Der aktuelle Funk-Test erreicht die Ziel-Node, wird dort aber mit
+   `NO_CHANNEL` abgelehnt. Laut Meshtastic-Firmware kann die Ziel-Node das Paket
+   dann nicht mit dem gemeinsamen Channel-PSK oder dem gespeicherten
+   Meshtastic-Public-Key entschlüsseln.
+4. Vor dem nächsten NYX-Codeumbau auf beiden Nodes denselben Primary Channel
+   und dieselbe PSK prüfen, veraltete NodeDB/Public-Key-Einträge erneuern und
+   zunächst eine normale Meshtastic-Direktnachricht testen.
 
 ## Nächster Task
 
-Untersuche die bestehende Meshtastic-Integration im Repository.
+Meshtastic-Konfiguration und Schlüsselaustausch zwischen `!9e76506c` und
+`!9e7638c4` korrigieren und den NYX-Zustellungstest erneut durchführen.
 
 Ziel:
 
-1. vorhandenen Code verstehen
-2. Verbindung zu `/dev/ttyUSB0` prüfen
-3. bestehende Architektur beibehalten
-4. nur notwendige Änderungen durchführen
-5. danach Build und Tests ausführen
+1. beide Nodes sehen einander mit aktuellen Public Keys in ihrer NodeDB
+2. beide Nodes verwenden denselben LoRa-Kanal einschließlich PSK
+3. normale Meshtastic-Direktnachricht funktioniert
+4. NYX meldet danach `zugestellt und bestätigt`
 
 Nicht sofort große Refactorings durchführen.
+
+## Verifiziert
+
+- USB-Verbindung und lokale Node-Erkennung mit realem HELTEC_V3
+- Android Universal-Debug-APK erfolgreich gebaut
+- APK: `dist/nyx-android-meshtastic-bluetooth-universal-debug.apk`
+- SHA-256: `696a22e5cd42c14bdf949136eb45eb96dd22ae33004ffd62dc45f05713865b73`
+- 43 Workspace-Tests erfolgreich
 
 ## Build
 
 ```bash
 cargo check
 cargo test
+./scripts/build-android.sh
+```

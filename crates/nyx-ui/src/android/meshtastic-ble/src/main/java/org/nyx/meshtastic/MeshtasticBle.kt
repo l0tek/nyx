@@ -28,6 +28,9 @@ class MeshtasticBle(private val activity: Activity) {
         @Volatile private var activeScanCallback: ScanCallback? = null
         @Volatile private var fromRadioPacket = ""
         @Volatile private var readInFlight = false
+        @Volatile private var writeInFlight = false
+        @Volatile private var pendingWrite: ByteArray? = null
+        private val operationLock = Any()
     }
 
     private val callback = object : BluetoothGattCallback() {
@@ -66,13 +69,17 @@ class MeshtasticBle(private val activity: Activity) {
             status: Int
         ) {
             if (characteristic.uuid == TO_RADIO) {
-                state = if (status == BluetoothGatt.GATT_SUCCESS) {
-                    "CONNECTED: Meshtastic BLE · ToRadio geschrieben"
-                } else if (status == BluetoothGatt.GATT_INSUFFICIENT_AUTHENTICATION) {
-                    g.device.createBond()
-                    "CONNECTED: Meshtastic BLE · Pairing/PIN erforderlich"
-                } else {
-                    "CONNECTED: Meshtastic BLE · ToRadio-Schreibfehler $status"
+                synchronized(operationLock) {
+                    writeInFlight = false
+                    state = if (status == BluetoothGatt.GATT_SUCCESS) {
+                        "CONNECTED: Meshtastic BLE · ToRadio geschrieben"
+                    } else if (status == BluetoothGatt.GATT_INSUFFICIENT_AUTHENTICATION) {
+                        g.device.createBond()
+                        "CONNECTED: Meshtastic BLE · Pairing/PIN erforderlich"
+                    } else {
+                        "CONNECTED: Meshtastic BLE · ToRadio-Schreibfehler $status"
+                    }
+                    startPendingWriteLocked(g)
                 }
             }
         }
@@ -84,10 +91,13 @@ class MeshtasticBle(private val activity: Activity) {
             status: Int
         ) {
             if (characteristic.uuid == FROM_RADIO) {
-                if (status == BluetoothGatt.GATT_SUCCESS && characteristic.value.isNotEmpty()) {
-                    fromRadioPacket = Base64.encodeToString(characteristic.value, Base64.NO_WRAP)
+                synchronized(operationLock) {
+                    if (status == BluetoothGatt.GATT_SUCCESS && characteristic.value.isNotEmpty()) {
+                        fromRadioPacket = Base64.encodeToString(characteristic.value, Base64.NO_WRAP)
+                    }
+                    readInFlight = false
+                    startPendingWriteLocked(g)
                 }
-                readInFlight = false
             }
         }
 
@@ -185,6 +195,8 @@ class MeshtasticBle(private val activity: Activity) {
             gatt?.close()
             fromRadioPacket = ""
             readInFlight = false
+            writeInFlight = false
+            pendingWrite = null
             state = "CONNECTING: $address"
             val adapter = activity.getSystemService(BluetoothManager::class.java).adapter
             gatt = adapter.getRemoteDevice(address).connectGatt(activity, false, callback, BluetoothDevice.TRANSPORT_LE)
@@ -216,6 +228,64 @@ class MeshtasticBle(private val activity: Activity) {
         } catch (_: IllegalArgumentException) {
             return "ERROR: Ungültiges ToRadio-Paket"
         }
+        synchronized(operationLock) {
+            if (readInFlight || writeInFlight) {
+                if (pendingWrite != null) return "ERROR: Meshtastic BLE-Schreibwarteschlange ist belegt"
+                pendingWrite = payload
+                return "QUEUED: Meshtastic-ToRadio-Paket wartet auf laufende GATT-Operation"
+            }
+            return if (startWriteLocked(connection, characteristic, payload)) {
+                "QUEUED: Meshtastic-ToRadio-Testpaket"
+            } else {
+                "ERROR: Meshtastic BLE-Schreibvorgang wurde abgelehnt"
+            }
+        }
+    }
+
+    fun readFromRadio(): String {
+        synchronized(operationLock) {
+            if (fromRadioPacket.isNotEmpty()) {
+                val packet = fromRadioPacket
+                fromRadioPacket = ""
+                return packet
+            }
+            if (readInFlight || writeInFlight || pendingWrite != null) return ""
+            val connection = gatt ?: return ""
+            val characteristic = connection.getService(SERVICE)?.getCharacteristic(FROM_RADIO)
+                ?: return ""
+            readInFlight = true
+            @Suppress("DEPRECATION")
+            if (!connection.readCharacteristic(characteristic)) readInFlight = false
+            return ""
+        }
+    }
+
+    fun disconnect(): String {
+        gatt?.disconnect()
+        gatt?.close()
+        gatt = null
+        fromRadioPacket = ""
+        readInFlight = false
+        writeInFlight = false
+        pendingWrite = null
+        state = "DISCONNECTED"
+        return "Meshtastic-Bluetooth getrennt"
+    }
+
+    private fun startPendingWriteLocked(connection: BluetoothGatt) {
+        val payload = pendingWrite ?: return
+        val characteristic = connection.getService(SERVICE)?.getCharacteristic(TO_RADIO) ?: return
+        pendingWrite = null
+        if (!startWriteLocked(connection, characteristic, payload)) {
+            state = "CONNECTED: Meshtastic BLE · wartender Schreibvorgang wurde abgelehnt"
+        }
+    }
+
+    private fun startWriteLocked(
+        connection: BluetoothGatt,
+        characteristic: BluetoothGattCharacteristic,
+        payload: ByteArray
+    ): Boolean {
         characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
         val accepted = if (Build.VERSION.SDK_INT >= 33) {
             connection.writeCharacteristic(
@@ -229,38 +299,8 @@ class MeshtasticBle(private val activity: Activity) {
             @Suppress("DEPRECATION")
             connection.writeCharacteristic(characteristic)
         }
-        return if (accepted) {
-            "QUEUED: Meshtastic-ToRadio-Testpaket"
-        } else {
-            "ERROR: Meshtastic BLE-Schreibvorgang wurde abgelehnt"
-        }
-    }
-
-    @Synchronized
-    fun readFromRadio(): String {
-        if (fromRadioPacket.isNotEmpty()) {
-            val packet = fromRadioPacket
-            fromRadioPacket = ""
-            return packet
-        }
-        if (readInFlight) return ""
-        val connection = gatt ?: return ""
-        val characteristic = connection.getService(SERVICE)?.getCharacteristic(FROM_RADIO)
-            ?: return ""
-        readInFlight = true
-        @Suppress("DEPRECATION")
-        if (!connection.readCharacteristic(characteristic)) readInFlight = false
-        return ""
-    }
-
-    fun disconnect(): String {
-        gatt?.disconnect()
-        gatt?.close()
-        gatt = null
-        fromRadioPacket = ""
-        readInFlight = false
-        state = "DISCONNECTED"
-        return "Meshtastic-Bluetooth getrennt"
+        writeInFlight = accepted
+        return accepted
     }
 
     private fun ensurePermissions(): Boolean {

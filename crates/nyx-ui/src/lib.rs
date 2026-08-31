@@ -622,7 +622,7 @@ pub fn App() -> Element {
                                                 let destination = contact_meshtastic_destination(&identity, device_id);
                                                 let message = match destination {
                                                     Ok((name, node)) => match send_meshtastic_test(node).await {
-                                                        Ok(()) => format!("Meshtastic-Test an {name} (!{node:08x}) gesendet"),
+                                                        Ok(()) => format!("Meshtastic-Test an {name} (!{node:08x}) zugestellt und bestätigt"),
                                                         Err(error) => format!("Meshtastic-Test fehlgeschlagen: {error}"),
                                                     },
                                                     Err(error) => format!("Meshtastic-Test fehlgeschlagen: {error}"),
@@ -1121,18 +1121,17 @@ async fn run_meshtastic_autoconnect(
 
         let mut port = port_signal.peek().trim().to_owned();
         #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-        if port.is_empty() {
-            if let Ok(ports) = meshtastic_usb::available_ports() {
-                if let Some(discovered) = ports.into_iter().find(|candidate| {
-                    candidate.contains("ttyUSB")
-                        || candidate.contains("ttyACM")
-                        || candidate.contains("cu.usb")
-                        || candidate.starts_with("COM")
-                }) {
-                    port = discovered;
-                    port_signal.set(port.clone());
-                }
-            }
+        if port.is_empty()
+            && let Ok(ports) = meshtastic_usb::available_ports()
+            && let Some(discovered) = ports.into_iter().find(|candidate| {
+                candidate.contains("ttyUSB")
+                    || candidate.contains("ttyACM")
+                    || candidate.contains("cu.usb")
+                    || candidate.starts_with("COM")
+            })
+        {
+            port = discovered;
+            port_signal.set(port.clone());
         }
 
         if port.is_empty() {
@@ -1230,10 +1229,10 @@ fn load_meshtastic_settings() -> MeshtasticSettings {
         // directory. Also check beside the executable so an existing setting
         // survives the move to the stable per-user configuration directory.
         let mut legacy_paths = vec![PathBuf::from("nyx-meshtastic-settings")];
-        if let Ok(executable) = std::env::current_exe() {
-            if let Some(directory) = executable.parent() {
-                legacy_paths.push(directory.join("nyx-meshtastic-settings"));
-            }
+        if let Ok(executable) = std::env::current_exe()
+            && let Some(directory) = executable.parent()
+        {
+            legacy_paths.push(directory.join("nyx-meshtastic-settings"));
         }
         legacy_paths
             .into_iter()
