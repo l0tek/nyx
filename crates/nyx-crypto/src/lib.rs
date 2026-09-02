@@ -471,6 +471,34 @@ impl DeviceIdentity {
         fingerprint(&self.snapshot.identity_public_key)
     }
 
+    pub fn sign_meshtastic_receipt(&self, id: Uuid, digest: [u8; 8]) -> [u8; 64] {
+        SigningKey::from_bytes(&self.snapshot.identity_secret_key)
+            .sign(&meshtastic_receipt_transcript(id, digest))
+            .to_bytes()
+    }
+
+    pub fn verify_contact_meshtastic_receipt(
+        &self,
+        device_id: Uuid,
+        id: Uuid,
+        digest: [u8; 8],
+        signature: [u8; 64],
+    ) -> Result<()> {
+        let contact = self
+            .snapshot
+            .contacts
+            .iter()
+            .find(|contact| contact.device_id == device_id && contact.verified)
+            .ok_or_else(|| anyhow::anyhow!("receipt signer is not a verified contact"))?;
+        let key = VerifyingKey::from_bytes(&contact.identity_public_key)
+            .context("receipt contact identity key is invalid")?;
+        key.verify(
+            &meshtastic_receipt_transcript(id, digest),
+            &Signature::from_bytes(&signature),
+        )
+        .context("Meshtastic processing receipt signature is invalid")
+    }
+
     pub fn contacts(&self) -> &[ContactRecord] {
         &self.snapshot.contacts
     }
@@ -1137,6 +1165,14 @@ fn fingerprint(public_key: &[u8; 32]) -> String {
         .map(|chunk| chunk.concat())
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn meshtastic_receipt_transcript(id: Uuid, digest: [u8; 8]) -> Vec<u8> {
+    let mut transcript = Vec::with_capacity(48);
+    transcript.extend_from_slice(b"NYX Meshtastic processing receipt v1");
+    transcript.extend_from_slice(id.as_bytes());
+    transcript.extend_from_slice(&digest);
+    transcript
 }
 
 #[derive(Zeroize, ZeroizeOnDrop)]
@@ -2084,6 +2120,30 @@ mod tests {
         assert!(restored.contacts()[0].verified);
         assert_eq!(restored.contacts()[0].device_id, alice.device_id());
         assert_eq!(restored.contacts()[0].meshtastic_node_id, Some(0xa1b2c3d4));
+    }
+
+    #[test]
+    fn meshtastic_processing_receipt_requires_verified_contact_signature() {
+        let mut alice = DeviceIdentity::generate("Alice").unwrap();
+        let invitation = alice
+            .create_invitation("25njqamcweflpvkl73j4szahhihoc4xt3ktcgjnpaingr5yhkenl5sid.onion")
+            .unwrap();
+        let mut bob = DeviceIdentity::generate("Bob").unwrap();
+        let contact = bob.import_invitation(&invitation).unwrap();
+        let id = Uuid::new_v4();
+        let digest = [7; 8];
+        let signature = alice.sign_meshtastic_receipt(id, digest);
+        assert!(
+            bob.verify_contact_meshtastic_receipt(contact.device_id, id, digest, signature)
+                .is_err()
+        );
+        bob.mark_contact_verified(contact.device_id).unwrap();
+        bob.verify_contact_meshtastic_receipt(contact.device_id, id, digest, signature)
+            .unwrap();
+        assert!(
+            bob.verify_contact_meshtastic_receipt(contact.device_id, id, [8; 8], signature)
+                .is_err()
+        );
     }
 
     #[test]

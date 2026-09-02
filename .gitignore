@@ -15,3 +15,5 @@ arti-client/
 *.nyx
 .env
 state/
+/scripts/build-android-local.sh
+/.local-tools/

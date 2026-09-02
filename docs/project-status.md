@@ -1,6 +1,6 @@
 # Nyx project status
 
-Status date: 2026-08-31
+Status date: 2026-09-02
 
 Nyx is an architecture/MVP implementation. It is not security-audited and is
 not suitable for sensitive or production communication.
@@ -65,6 +65,16 @@ not suitable for sensitive or production communication.
   UUID, fragment index/count, and a truncated BLAKE3 whole-message digest.
   Payloads are split below Meshtastic's 233-byte application limit and capped at
   16 KiB. Unit tests verify bounds, stable identity, and invalid-size rejection.
+- Desktop USB and Android BLE now accept `NYXM` fragments, reassemble bounded
+  messages out of order, reject conflicting metadata and digest mismatches, and
+  pass only complete client payloads to the existing MLS receive path. The
+  claimed radio source must match the node ID bound to the verified contact.
+- After MLS decryption and atomic vault persistence, the receiver returns a
+  compact processing receipt signed by its persistent Ed25519 device identity.
+  The sender verifies the signature, message UUID, ciphertext digest, bound
+  contact node, and mailbox capability before retiring the Tor outbox item.
+  Radio routing ACKs alone still never mark an item delivered. Unconfirmed
+  fallback items become eligible for retransmission after 60 seconds.
 - The status screen can send a `PRIVATE_APP` test packet to the Meshtastic node
   stored on the selected verified contact. Desktop uses USB StreamAPI; Android
   encodes `ToRadio` and writes it to the official GATT characteristic.
@@ -235,13 +245,11 @@ not suitable for sensitive or production communication.
 - Android QR scanning depends on camera permission and the system WebView's
   `BarcodeDetector` QR support. Device-level camera scanning and Tor bootstrap
   still require acceptance testing on representative Android versions.
-- Meshtastic inbound `NYXM` reassembly, end-to-end fallback receipts, selective
-  missing-fragment retransmission, durable fragment state, Android BLE payload
-  transfer, and authenticated automatic peer-node discovery are not
-  implemented. Until those pieces exist, the current Tor-first Meshtastic path
-  is an experimental outbound dispatch mechanism, not a complete alternative
-  delivery channel. Initial MLS Welcome/KeyPackage transfer and large files
-  remain Tor/QR-only. No radio hardware interoperability test has been run.
+- Selective missing-fragment retransmission, durable partial fragment state,
+  and authenticated automatic peer-node discovery are not implemented. Initial
+  MLS Welcome/KeyPackage transfer and large files remain Tor/QR-only. The new
+  bidirectional Android BLE payload path still requires a radio hardware
+  interoperability test.
 
 ## Current live integration status
 
@@ -297,7 +305,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo check --workspace
 ```
 
-All commands pass, including 43 workspace tests. A successful compile and unit-test run does not verify
+All commands pass, including 46 workspace tests. A successful compile and unit-test run does not verify
 publication or reachability on the public Tor network.
 
 The desktop client was also connected to a real HELTEC_V3 over `/dev/ttyUSB0`
@@ -321,11 +329,10 @@ step can create an APK that crashes at startup because `libssl.so` is absent.
 
 ## Next milestone
 
-The immediate Meshtastic milestone is implementing authenticated inbound
-fragment reassembly and an MLS-processing receipt before allowing a successful
-radio fallback to retire a Tor queue item. Selective retransmission, durable
-partial state, verified contact-to-node binding, and Android BLE payload transfer
-follow. The Tor milestone remains confirming Android-to-desktop invitation flow
+The immediate Meshtastic milestone is verifying bidirectional USB/BLE fallback
+with the two physical nodes, including signed processing receipts and retry
+behavior. Selective retransmission and durable partial state follow. The Tor
+milestone remains confirming Android-to-desktop invitation flow
 on the public test setup and converting it into an isolated live integration test.
 
 ## Resume notes

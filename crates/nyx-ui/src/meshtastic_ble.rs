@@ -1,14 +1,39 @@
 use super::MeshtasticStatus;
+use crate::mesh_fragment;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use dioxus::prelude::*;
 use jni::objects::{JClass, JString, JValue};
 use meshtastic::Message;
 use std::{
+    collections::VecDeque,
     sync::{Mutex, OnceLock},
     time::Duration,
 };
 
 static NYX_CHANNEL: OnceLock<Mutex<Option<meshtastic::protobufs::Channel>>> = OnceLock::new();
+static INBOUND_EVENTS: OnceLock<Mutex<VecDeque<mesh_fragment::InboundEvent>>> = OnceLock::new();
+static REASSEMBLER: OnceLock<Mutex<mesh_fragment::Reassembler>> = OnceLock::new();
+static FALLBACK_ATTEMPTED: OnceLock<Mutex<Vec<(uuid::Uuid, std::time::Instant)>>> = OnceLock::new();
+
+pub(super) fn drain_inbound_events() -> Vec<mesh_fragment::InboundEvent> {
+    INBOUND_EVENTS
+        .get_or_init(|| Mutex::new(VecDeque::new()))
+        .lock()
+        .map(|mut events| events.drain(..).collect())
+        .unwrap_or_default()
+}
+
+fn push_inbound_event(event: mesh_fragment::InboundEvent) {
+    if let Ok(mut events) = INBOUND_EVENTS
+        .get_or_init(|| Mutex::new(VecDeque::new()))
+        .lock()
+    {
+        if events.len() >= 128 {
+            events.pop_front();
+        }
+        events.push_back(event);
+    }
+}
 
 pub(super) fn nyx_channel_bootstrap() -> Option<Vec<u8>> {
     NYX_CHANNEL
@@ -175,6 +200,117 @@ pub(super) fn send_to_radio(packet: &[u8]) -> Result<(), String> {
     }
 }
 
+pub(super) fn dispatch_fallback(
+    id: uuid::Uuid,
+    destination: u32,
+    ciphertext: &[u8],
+    channel_index: u32,
+) -> Result<bool, String> {
+    let mut attempted = FALLBACK_ATTEMPTED
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .map_err(|_| "Meshtastic BLE fallback lock is poisoned")?;
+    attempted.retain(|(_, sent)| sent.elapsed() < Duration::from_secs(60));
+    if attempted
+        .iter()
+        .any(|(attempted_id, _)| attempted_id == &id)
+    {
+        return Ok(false);
+    }
+    for fragment in mesh_fragment::fragment(id, ciphertext)? {
+        send_private_packet(destination, channel_index, fragment)?;
+    }
+    attempted.push((id, std::time::Instant::now()));
+    Ok(true)
+}
+
+pub(super) fn dispatch_receipt(
+    destination: u32,
+    id: uuid::Uuid,
+    digest: [u8; 8],
+    signature: [u8; 64],
+    channel_index: u32,
+) -> Result<(), String> {
+    send_private_packet(
+        destination,
+        channel_index,
+        mesh_fragment::receipt(id, digest, signature),
+    )
+}
+
+fn send_private_packet(
+    destination: u32,
+    channel_index: u32,
+    payload: Vec<u8>,
+) -> Result<(), String> {
+    let packet = meshtastic::protobufs::MeshPacket {
+        to: destination,
+        channel: channel_index,
+        id: uuid::Uuid::new_v4().as_u128() as u32,
+        want_ack: true,
+        payload_variant: Some(meshtastic::protobufs::mesh_packet::PayloadVariant::Decoded(
+            meshtastic::protobufs::Data {
+                portnum: meshtastic::protobufs::PortNum::PrivateApp as i32,
+                payload,
+                ..Default::default()
+            },
+        )),
+        ..Default::default()
+    };
+    let to_radio = meshtastic::protobufs::ToRadio {
+        payload_variant: Some(meshtastic::protobufs::to_radio::PayloadVariant::Packet(
+            packet,
+        )),
+    };
+    send_to_radio(&to_radio.encode_to_vec())
+}
+
+fn handle_mesh_packet(packet: &meshtastic::protobufs::MeshPacket) {
+    if packet.from == 0 {
+        return;
+    }
+    let Some(meshtastic::protobufs::mesh_packet::PayloadVariant::Decoded(data)) =
+        &packet.payload_variant
+    else {
+        return;
+    };
+    if data.portnum != meshtastic::protobufs::PortNum::PrivateApp as i32 {
+        return;
+    }
+    match mesh_fragment::parse(&data.payload) {
+        Ok(mesh_fragment::MeshFrame::Receipt {
+            id,
+            digest,
+            signature,
+        }) => push_inbound_event(mesh_fragment::InboundEvent::Receipt {
+            source: packet.from,
+            id,
+            digest,
+            signature,
+        }),
+        Ok(mesh_fragment::MeshFrame::Fragment(_)) => {
+            if let Ok(mut reassembler) = REASSEMBLER
+                .get_or_init(|| Mutex::new(mesh_fragment::Reassembler::default()))
+                .lock()
+            {
+                match reassembler.push(packet.from, &data.payload) {
+                    Ok(Some(message)) => push_inbound_event(mesh_fragment::InboundEvent::Message {
+                        source: packet.from,
+                        id: message.id,
+                        digest: message.digest,
+                        payload: message.payload,
+                    }),
+                    Ok(None) => {}
+                    Err(error) => {
+                        super::append_log("WARN", &format!("BLE-Nachricht verworfen: {error}"))
+                    }
+                }
+            }
+        }
+        Err(_) => {}
+    }
+}
+
 pub(super) async fn monitor(
     id: u64,
     mut state: Signal<MeshtasticStatus>,
@@ -249,6 +385,7 @@ pub(super) async fn monitor(
                                                 super::append_log("INFO", &format!("Privater Meshtastic-Kanal NYX auf BLE-Index {index} erkannt"));
                                             }
                                         }
+                                        Some(meshtastic::protobufs::from_radio::PayloadVariant::Packet(packet)) => handle_mesh_packet(&packet),
                                         _ => {}
                                     }
                                 }

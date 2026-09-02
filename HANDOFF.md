@@ -102,8 +102,8 @@ Nicht sofort große Refactorings durchführen.
 - USB-Verbindung und lokale Node-Erkennung mit realem HELTEC_V3
 - Android Universal-Debug-APK erfolgreich gebaut
 - APK: `dist/nyx-android-meshtastic-bluetooth-universal-debug.apk`
-- SHA-256: `6de36e882ba7a9409ba051b883117e79105c7f0b05c69d389d600cb23391f512`
-- 43 Workspace-Tests erfolgreich
+- SHA-256: `afddbb52b34bdcb762ce02c66c09872d2d8c317f0af1e3a50050fe6c3bbc3cf8`
+- 46 Workspace-Tests erfolgreich
 
 ## Build
 

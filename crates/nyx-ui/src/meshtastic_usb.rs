@@ -5,23 +5,31 @@ use meshtastic::{Message, api::StreamApi, protobufs::from_radio::PayloadVariant,
 use meshtastic::{packet::PacketRouter, types::NodeId};
 use rand::{RngCore, rngs::OsRng};
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     sync::{Mutex, OnceLock},
     time::{Duration, Instant},
 };
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
-struct FallbackCommand {
-    id: Uuid,
-    destination: u32,
-    ciphertext: Vec<u8>,
-    result: oneshot::Sender<Result<bool, String>>,
+enum SessionCommand {
+    Dispatch {
+        id: Uuid,
+        destination: u32,
+        ciphertext: Vec<u8>,
+        result: oneshot::Sender<Result<bool, String>>,
+    },
+    Receipt {
+        id: Uuid,
+        destination: u32,
+        digest: [u8; 8],
+        signature: [u8; 64],
+    },
 }
 
 struct FallbackSession {
     id: u64,
-    sender: mpsc::UnboundedSender<FallbackCommand>,
+    sender: mpsc::UnboundedSender<SessionCommand>,
 }
 
 struct PendingAcknowledgement {
@@ -32,6 +40,27 @@ struct PendingAcknowledgement {
 
 static FALLBACK_SESSION: OnceLock<Mutex<Option<FallbackSession>>> = OnceLock::new();
 static NYX_CHANNEL: OnceLock<Mutex<Option<meshtastic::protobufs::Channel>>> = OnceLock::new();
+static INBOUND_EVENTS: OnceLock<Mutex<VecDeque<mesh_fragment::InboundEvent>>> = OnceLock::new();
+
+pub(super) fn drain_inbound_events() -> Vec<mesh_fragment::InboundEvent> {
+    INBOUND_EVENTS
+        .get_or_init(|| Mutex::new(VecDeque::new()))
+        .lock()
+        .map(|mut events| events.drain(..).collect())
+        .unwrap_or_default()
+}
+
+fn push_inbound_event(event: mesh_fragment::InboundEvent) {
+    if let Ok(mut events) = INBOUND_EVENTS
+        .get_or_init(|| Mutex::new(VecDeque::new()))
+        .lock()
+    {
+        if events.len() >= 128 {
+            events.pop_front();
+        }
+        events.push_back(event);
+    }
+}
 
 pub(super) fn nyx_channel_bootstrap() -> Option<Vec<u8>> {
     NYX_CHANNEL
@@ -84,7 +113,7 @@ pub(super) async fn dispatch_fallback(
         .ok_or_else(|| "no configured Meshtastic USB session".to_owned())?;
     let (result_tx, result_rx) = oneshot::channel();
     sender
-        .send(FallbackCommand {
+        .send(SessionCommand::Dispatch {
             id,
             destination,
             ciphertext,
@@ -92,6 +121,29 @@ pub(super) async fn dispatch_fallback(
         })
         .map_err(|_| "Meshtastic session ended")?;
     result_rx.await.map_err(|_| "Meshtastic session ended")?
+}
+
+pub(super) fn dispatch_receipt(
+    destination: u32,
+    id: Uuid,
+    digest: [u8; 8],
+    signature: [u8; 64],
+) -> Result<(), String> {
+    let sender = FALLBACK_SESSION
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .map_err(|_| "Meshtastic fallback lock is poisoned")?
+        .as_ref()
+        .map(|session| session.sender.clone())
+        .ok_or_else(|| "no configured Meshtastic USB session".to_owned())?;
+    sender
+        .send(SessionCommand::Receipt {
+            id,
+            destination,
+            digest,
+            signature,
+        })
+        .map_err(|_| "Meshtastic session ended".to_owned())
 }
 
 pub(super) fn available_ports() -> Result<Vec<String>, String> {
@@ -166,8 +218,9 @@ pub(super) async fn run_session(
             sender: fallback_tx,
         });
     }
-    let mut fallback_attempted = HashSet::<Uuid>::new();
+    let mut fallback_attempted = Vec::<(Uuid, Instant)>::new();
     let mut pending_acknowledgements = Vec::<PendingAcknowledgement>::new();
+    let mut reassembler = mesh_fragment::Reassembler::default();
     loop {
         tokio::select! {
             packet = packets.recv() => {
@@ -193,6 +246,28 @@ pub(super) async fn run_session(
                             let pending = pending_acknowledgements.swap_remove(index);
                             let _ = pending.result.send(Ok(true));
                         }
+                    }
+                }
+                if let Some(PayloadVariant::Packet(mesh_packet)) = &packet.payload_variant
+                    && mesh_packet.from != 0
+                    && let Some(meshtastic::protobufs::mesh_packet::PayloadVariant::Decoded(data)) = &mesh_packet.payload_variant
+                    && data.portnum == meshtastic::protobufs::PortNum::PrivateApp as i32
+                {
+                    match mesh_fragment::parse(&data.payload) {
+                        Ok(mesh_fragment::MeshFrame::Receipt { id, digest, signature }) => {
+                            push_inbound_event(mesh_fragment::InboundEvent::Receipt { source: mesh_packet.from, id, digest, signature });
+                        }
+                        Ok(mesh_fragment::MeshFrame::Fragment(_)) => match reassembler.push(mesh_packet.from, &data.payload) {
+                            Ok(Some(message)) => push_inbound_event(mesh_fragment::InboundEvent::Message {
+                                source: mesh_packet.from,
+                                id: message.id,
+                                digest: message.digest,
+                                payload: message.payload,
+                            }),
+                            Ok(None) => {}
+                            Err(error) => super::append_log("WARN", &format!("Meshtastic-Nachricht verworfen: {error}")),
+                        },
+                        Err(_) => {}
                     }
                 }
                 match packet.payload_variant {
@@ -255,24 +330,32 @@ pub(super) async fn run_session(
                 });
             }
             Some(command) = fallback_rx.recv() => {
-                if fallback_attempted.contains(&command.id) {
-                    let _ = command.result.send(Ok(false));
-                } else if own_node.is_none() {
-                    let _ = command.result.send(Err(
-                        "Meshtastic node identity is not available yet".into(),
-                    ));
-                } else {
-                    match send_fallback_fragments(&mut api, own_node.unwrap_or_default(), command.destination, command.id, &command.ciphertext, channel_index).await {
-                        Ok(packet_ids) => {
-                            fallback_attempted.insert(command.id);
-                            pending_acknowledgements.push(PendingAcknowledgement {
-                                packet_ids: packet_ids.into_iter().collect(),
-                                deadline: Instant::now() + Duration::from_secs(15),
-                                result: command.result,
-                            });
+                match command {
+                    SessionCommand::Dispatch { id, destination, ciphertext, result } => {
+                        fallback_attempted.retain(|(_, attempted)| attempted.elapsed() < Duration::from_secs(60));
+                        if fallback_attempted.iter().any(|(attempted_id, _)| attempted_id == &id) {
+                            let _ = result.send(Ok(false));
+                        } else if own_node.is_none() {
+                            let _ = result.send(Err("Meshtastic node identity is not available yet".into()));
+                        } else {
+                            match send_fallback_fragments(&mut api, own_node.unwrap_or_default(), destination, id, &ciphertext, channel_index).await {
+                                Ok(packet_ids) => {
+                                    fallback_attempted.push((id, Instant::now()));
+                                    pending_acknowledgements.push(PendingAcknowledgement {
+                                        packet_ids: packet_ids.into_iter().collect(),
+                                        deadline: Instant::now() + Duration::from_secs(15),
+                                        result,
+                                    });
+                                }
+                                Err(error) => { let _ = result.send(Err(error)); }
+                            }
                         }
-                        Err(error) => {
-                            let _ = command.result.send(Err(error));
+                    }
+                    SessionCommand::Receipt { id, destination, digest, signature } => {
+                        if let Some(source) = own_node
+                            && let Err(error) = send_receipt(&mut api, source, destination, id, digest, signature, channel_index).await
+                        {
+                            super::append_log("WARN", &format!("Meshtastic-Receipt konnte nicht gesendet werden: {error}"));
                         }
                     }
                 }
@@ -306,6 +389,37 @@ pub(super) async fn run_session(
     {
         *session = None;
     }
+}
+
+async fn send_receipt(
+    api: &mut meshtastic::api::ConnectedStreamApi,
+    source: u32,
+    destination: u32,
+    id: Uuid,
+    digest: [u8; 8],
+    signature: [u8; 64],
+    channel_index: u32,
+) -> Result<(), String> {
+    let packet = meshtastic::protobufs::MeshPacket {
+        from: source,
+        to: destination,
+        id: utils::generate_rand_id(),
+        channel: channel_index,
+        want_ack: true,
+        payload_variant: Some(meshtastic::protobufs::mesh_packet::PayloadVariant::Decoded(
+            meshtastic::protobufs::Data {
+                portnum: meshtastic::protobufs::PortNum::PrivateApp as i32,
+                payload: mesh_fragment::receipt(id, digest, signature),
+                ..Default::default()
+            },
+        )),
+        ..Default::default()
+    };
+    api.send_to_radio_packet(Some(
+        meshtastic::protobufs::to_radio::PayloadVariant::Packet(packet),
+    ))
+    .await
+    .map_err(|error| format!("Meshtastic receipt dispatch failed: {error}"))
 }
 
 async fn ensure_nyx_channel(

@@ -144,6 +144,12 @@ struct DisplayMessage {
     incoming: bool,
 }
 
+struct ProcessedMeshMessage {
+    contact_device_id: uuid::Uuid,
+    plaintext: Option<Vec<u8>>,
+    receipt_signature: [u8; 64],
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ConnectionPhase {
     Disabled,
@@ -371,6 +377,16 @@ pub fn App() -> Element {
             autosave_password,
             selected_contact,
             app_view,
+        )
+    });
+    use_future(move || {
+        run_meshtastic_receive_worker(
+            startup_ready,
+            identity,
+            messages,
+            last_error,
+            autosave_password,
+            meshtastic_channel_index,
         )
     });
     use_future(move || {
@@ -1840,6 +1856,7 @@ async fn attempt_meshtastic_fallback(
             device
                 .contacts()
                 .iter()
+                .filter(|contact| contact.verified)
                 .filter_map(|contact| {
                     contact
                         .meshtastic_node_id
@@ -1863,6 +1880,243 @@ async fn attempt_meshtastic_fallback(
         }
     }
     Ok(dispatched)
+}
+
+async fn run_meshtastic_receive_worker(
+    startup_ready: Signal<bool>,
+    mut identity: Signal<Result<Option<DeviceIdentity>, String>>,
+    mut messages: Signal<Vec<DisplayMessage>>,
+    mut last_error: Signal<Option<String>>,
+    autosave_password: Signal<Zeroizing<Vec<u8>>>,
+    channel_index: Signal<u32>,
+) {
+    while !*startup_ready.read() {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let queue = match DeliveryQueue::open(delivery_queue_path()) {
+        Ok(queue) => queue,
+        Err(error) => {
+            last_error.set(Some(format!(
+                "Meshtastic-Outbox konnte nicht geöffnet werden: {error}"
+            )));
+            return;
+        }
+    };
+    loop {
+        for event in drain_meshtastic_events() {
+            match event {
+                mesh_fragment::InboundEvent::Receipt {
+                    source,
+                    id,
+                    digest,
+                    signature,
+                } => {
+                    if let Err(error) =
+                        accept_meshtastic_receipt(&queue, &identity, source, id, digest, signature)
+                    {
+                        append_log("WARN", &format!("Meshtastic-Receipt verworfen: {error}"));
+                    } else {
+                        append_log("INFO", "Meshtastic-Nachricht Ende-zu-Ende bestätigt");
+                    }
+                }
+                mesh_fragment::InboundEvent::Message {
+                    source,
+                    id,
+                    digest,
+                    payload,
+                } => {
+                    if autosave_password.read().is_empty() {
+                        last_error.set(Some(
+                            "Tresor entsperren, um Meshtastic-Nachrichten zu empfangen".into(),
+                        ));
+                        continue;
+                    }
+                    match process_meshtastic_message(
+                        &mut identity,
+                        autosave_password.read().as_slice(),
+                        source,
+                        id,
+                        digest,
+                        &payload,
+                    ) {
+                        Ok(processed) => {
+                            if let Some(plaintext) = processed.plaintext {
+                                match String::from_utf8(plaintext) {
+                                    Ok(plaintext) => messages.write().push(DisplayMessage {
+                                        contact_device_id: Some(processed.contact_device_id),
+                                        plaintext,
+                                        ciphertext_size: payload.len(),
+                                        queued: false,
+                                        incoming: true,
+                                    }),
+                                    Err(_) => last_error.set(Some(
+                                        "Empfangene MLS-Nachricht ist kein UTF-8".into(),
+                                    )),
+                                }
+                            }
+                            if let Err(error) = dispatch_meshtastic_receipt(
+                                source,
+                                id,
+                                digest,
+                                processed.receipt_signature,
+                                *channel_index.peek(),
+                            ) {
+                                last_error.set(Some(format!(
+                                    "Meshtastic-Nachricht verarbeitet, Receipt ausstehend: {error}"
+                                )));
+                            }
+                        }
+                        Err(error) => {
+                            last_error.set(Some(format!("Meshtastic-Nachricht verworfen: {error}")))
+                        }
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+fn mesh_processing_receipt(source: u32, id: uuid::Uuid, digest: [u8; 8]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"NYX Meshtastic MLS processing receipt v1");
+    hasher.update(&source.to_be_bytes());
+    hasher.update(id.as_bytes());
+    hasher.update(&digest);
+    *hasher.finalize().as_bytes()
+}
+
+fn process_meshtastic_message(
+    identity: &mut Signal<Result<Option<DeviceIdentity>, String>>,
+    password: &[u8],
+    source: u32,
+    id: uuid::Uuid,
+    digest: [u8; 8],
+    payload: &[u8],
+) -> Result<ProcessedMeshMessage, String> {
+    let ClientPayload::MlsApplication {
+        sender_device,
+        ciphertext,
+    } = decode_client_payload(payload).map_err(|_| "ungültige NYX-Nutzdaten".to_owned())?
+    else {
+        return Err("Meshtastic akzeptiert derzeit nur etablierte MLS-Chats".into());
+    };
+    let receipt = mesh_processing_receipt(source, id, digest);
+    let mut state = identity.write();
+    let device = state
+        .as_mut()
+        .map_err(|error| error.clone())?
+        .as_mut()
+        .ok_or_else(|| "Geräteidentität ist gesperrt".to_owned())?;
+    let contact = device
+        .contacts()
+        .iter()
+        .find(|contact| contact.device_id == sender_device)
+        .ok_or_else(|| "Absender ist kein bekannter Kontakt".to_owned())?;
+    if !contact.verified || contact.meshtastic_node_id != Some(source) {
+        return Err("Meshtastic-Node ist nicht an diesen verifizierten Kontakt gebunden".into());
+    }
+    if device.has_remote_inbound_receipt(&receipt) {
+        return Ok(ProcessedMeshMessage {
+            contact_device_id: sender_device,
+            plaintext: None,
+            receipt_signature: device.sign_meshtastic_receipt(id, digest),
+        });
+    }
+    let expires = std::time::SystemTime::now()
+        .checked_add(Duration::from_secs(7 * 24 * 60 * 60))
+        .ok_or_else(|| "Meshtastic-Receipt-Ablaufzeit ist ungültig".to_owned())?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "Systemzeit liegt vor Unix-Epoche".to_owned())?
+        .as_millis();
+    let expires = i64::try_from(expires)
+        .map_err(|_| "Meshtastic-Receipt-Ablaufzeit ist zu groß".to_owned())?;
+    device
+        .process_remote_inbound_and_save(
+            sender_device,
+            &ciphertext,
+            receipt,
+            expires,
+            identity_path(),
+            password,
+        )
+        .map(|plaintext| {
+            let signature = device.sign_meshtastic_receipt(id, digest);
+            ProcessedMeshMessage {
+                contact_device_id: sender_device,
+                plaintext: Some(plaintext),
+                receipt_signature: signature,
+            }
+        })
+        .map_err(|error| error.to_string())
+}
+
+fn accept_meshtastic_receipt(
+    queue: &DeliveryQueue,
+    identity: &Signal<Result<Option<DeviceIdentity>, String>>,
+    source: u32,
+    id: uuid::Uuid,
+    digest: [u8; 8],
+    signature: [u8; 64],
+) -> Result<(), String> {
+    let pending = queue
+        .pending(128)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|item| item.id == id)
+        .ok_or_else(|| "Receipt gehört zu keiner ausstehenden Nachricht".to_owned())?;
+    if blake3::hash(&pending.envelope.ciphertext).as_bytes()[..8] != digest {
+        return Err("Receipt-Digest stimmt nicht mit der Outbox überein".into());
+    }
+    let state = identity.read();
+    let device = state
+        .as_ref()
+        .map_err(|error| error.clone())?
+        .as_ref()
+        .ok_or_else(|| "Geräteidentität ist gesperrt".to_owned())?;
+    let signer = device.contacts().iter().find(|contact| {
+        contact.verified
+            && contact.meshtastic_node_id == Some(source)
+            && contact.send_mailbox_token == pending.envelope.mailbox_token
+    });
+    let signer =
+        signer.ok_or_else(|| "Receipt stammt nicht von der gebundenen Kontakt-Node".to_owned())?;
+    device
+        .verify_contact_meshtastic_receipt(signer.device_id, id, digest, signature)
+        .map_err(|error| error.to_string())?;
+    queue.mark_delivered(id).map_err(|error| error.to_string())
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+fn drain_meshtastic_events() -> Vec<mesh_fragment::InboundEvent> {
+    meshtastic_usb::drain_inbound_events()
+}
+
+#[cfg(target_os = "android")]
+fn drain_meshtastic_events() -> Vec<mesh_fragment::InboundEvent> {
+    meshtastic_ble::drain_inbound_events()
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+fn dispatch_meshtastic_receipt(
+    destination: u32,
+    id: uuid::Uuid,
+    digest: [u8; 8],
+    signature: [u8; 64],
+    _channel_index: u32,
+) -> Result<(), String> {
+    meshtastic_usb::dispatch_receipt(destination, id, digest, signature)
+}
+
+#[cfg(target_os = "android")]
+fn dispatch_meshtastic_receipt(
+    destination: u32,
+    id: uuid::Uuid,
+    digest: [u8; 8],
+    signature: [u8; 64],
+    channel_index: u32,
+) -> Result<(), String> {
+    meshtastic_ble::dispatch_receipt(destination, id, digest, signature, channel_index)
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
@@ -1933,10 +2187,46 @@ fn contact_meshtastic_destination(
 
 #[cfg(target_os = "android")]
 async fn attempt_meshtastic_fallback(
-    _queue: &DeliveryQueue,
-    _identity: Signal<Result<Option<DeviceIdentity>, String>>,
+    queue: &DeliveryQueue,
+    identity: Signal<Result<Option<DeviceIdentity>, String>>,
 ) -> Result<usize, String> {
-    Err("Android BLE fallback data transport is not available yet".into())
+    let destinations = identity
+        .read()
+        .as_ref()
+        .ok()
+        .and_then(Option::as_ref)
+        .map(|device| {
+            device
+                .contacts()
+                .iter()
+                .filter(|contact| contact.verified)
+                .filter_map(|contact| {
+                    contact
+                        .meshtastic_node_id
+                        .map(|node| (contact.send_mailbox_token, node))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let channel_index = load_meshtastic_settings().channel_index;
+    let mut dispatched = 0;
+    for item in queue.pending(8).map_err(|error| error.to_string())? {
+        let Some((_, destination)) = destinations
+            .iter()
+            .find(|(token, _)| token == &item.envelope.mailbox_token)
+        else {
+            continue;
+        };
+        if meshtastic_ble::dispatch_fallback(
+            item.id,
+            *destination,
+            &item.envelope.ciphertext,
+            channel_index,
+        )? {
+            dispatched += 1;
+        }
+    }
+    Ok(dispatched)
 }
 
 fn update_connection_status(
